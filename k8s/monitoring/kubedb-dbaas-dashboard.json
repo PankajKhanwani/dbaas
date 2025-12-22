@@ -1,0 +1,218 @@
+{
+  "title": "KubeDB DBaaS - Database Monitoring",
+  "uid": "kubedb-dbaas-monitoring",
+  "tags": ["kubedb", "mongodb", "dbaas"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "database_id",
+        "label": "Database",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(mongodb_up{managed_by=\"kubedb-dbaas\"}, database_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Database Status",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "mongodb_up{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": 0, "color": "red"},
+              {"value": 1, "color": "green"}
+            ]
+          },
+          "mappings": [
+            {"type": "value", "value": "1", "text": "UP"},
+            {"type": "value", "value": "0", "text": "DOWN"}
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Active Connections",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "mongodb_ss_connections{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\", conn_type=\"current\"}",
+          "legendFormat": "{{database_id}} - current",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Database Size (GB)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "mongodb_dbstats_dataSize{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"} / 1024 / 1024 / 1024",
+          "legendFormat": "{{database_id}} - {{database}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Storage Size (GB)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "mongodb_dbstats_storageSize{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"} / 1024 / 1024 / 1024",
+          "legendFormat": "{{database_id}} - {{database}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Collections",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 12},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by(database_id) (mongodb_dbstats_collections{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"}
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Total Objects",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 12},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by(database_id) (mongodb_dbstats_objects{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"}
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Index Size (GB)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "mongodb_dbstats_indexSize{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"} / 1024 / 1024 / 1024",
+          "legendFormat": "{{database_id}} - {{database}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Operations Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(mongodb_ss_opcounters{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"}[5m])",
+          "legendFormat": "{{database_id}} - {{type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Slow Queries",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(mongodb_profile_slow_query_count{managed_by=\"kubedb-dbaas\", database_id=~\"$database_id\"}[5m])",
+          "legendFormat": "{{database_id}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import './App.css'
 
-const API_BASE = 'http://localhost:8000/api/v1'
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 const DOMAIN = 'demo'
 const PROJECT = 'demo'
 
@@ -21,6 +21,10 @@ function App() {
   const [view, setView] = useState('grid')
   const [metricSearch, setMetricSearch] = useState('')
   const [collapsedCategories, setCollapsedCategories] = useState({})
+  const [availableUpgrades, setAvailableUpgrades] = useState([])
+  const [upgradeLoading, setUpgradeLoading] = useState(false)
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
+  const [selectedUpgradeVersion, setSelectedUpgradeVersion] = useState('')
 
   const [newDb, setNewDb] = useState({
     name: '',
@@ -307,6 +311,67 @@ function App() {
       fetchDatabases()
     } catch (error) {
       showNotification('Failed to resume database', 'error')
+    }
+  }
+
+  // Helper function to determine upgrade type
+  const getUpgradeType = (currentVersion, targetVersion) => {
+    const parseCurrent = currentVersion.split('.').map(v => parseInt(v.replace(/\D/g, '')) || 0)
+    const parseTarget = targetVersion.split('.').map(v => parseInt(v.replace(/\D/g, '')) || 0)
+
+    if (parseCurrent[0] !== parseTarget[0]) return 'MAJOR'
+    if (parseCurrent[1] !== parseTarget[1]) return 'MINOR'
+    return 'PATCH'
+  }
+
+  const fetchAvailableUpgrades = async (id) => {
+    setUpgradeLoading(true)
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/available-upgrades`)
+      const data = await response.json()
+      setAvailableUpgrades(data.available_upgrades || [])
+      return data
+    } catch (error) {
+      showNotification('Failed to fetch available upgrades', 'error')
+      setAvailableUpgrades([])
+    } finally {
+      setUpgradeLoading(false)
+    }
+  }
+
+  const upgradeDatabase = async (id, targetVersion) => {
+    if (!targetVersion) {
+      showNotification('Please select a version to upgrade to', 'error')
+      return
+    }
+
+    if (!confirm(`Are you sure you want to upgrade to version ${targetVersion}? This operation cannot be undone and may cause temporary downtime.`)) {
+      return
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/upgrade`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target_version: targetVersion,
+          skip_backup: false,
+          apply_immediately: true
+        })
+      })
+
+      const data = await response.json()
+
+      if (data.error) {
+        showNotification(`Upgrade failed: ${data.error}`, 'error')
+      } else {
+        showNotification(`Database upgrade to ${targetVersion} initiated!`)
+        setShowUpgradeModal(false)
+        setSelectedUpgradeVersion('')
+        fetchDatabases()
+      }
+    } catch (error) {
+      showNotification('Failed to initiate upgrade', 'error')
     }
   }
 
@@ -623,8 +688,8 @@ function App() {
                               setNewDb({ ...newDb, region, engine: '', version: '' })
                               setAvailableVersions([])
                               setAvailableEngines({})
-                              // Fetch engines when region changes
-                              if (region) {
+                              // Fetch engines only when both region AND AZ are provided
+                              if (region && newDb.availability_zone) {
                                 fetchEnginesFromProvider(region, newDb.availability_zone)
                               }
                             }}
@@ -636,7 +701,7 @@ function App() {
                         </div>
 
                         <div className="form-group-inline">
-                          <label>Availability Zone <span className="optional">(optional)</span></label>
+                          <label>Availability Zone <span className="required">*</span></label>
                           <input
                             type="text"
                             value={newDb.availability_zone}
@@ -645,15 +710,16 @@ function App() {
                               setNewDb({ ...newDb, availability_zone: az, engine: '', version: '' })
                               setAvailableVersions([])
                               setAvailableEngines({})
-                              // Fetch engines when AZ changes
-                              if (newDb.region) {
+                              // Fetch engines when AZ changes (only if region is also set)
+                              if (newDb.region && az) {
                                 fetchEnginesFromProvider(newDb.region, az)
                               }
                             }}
-                            placeholder="e.g., us-east-1a"
+                            placeholder="e.g., AZ1"
                             className="input-large"
+                            required
                           />
-                          <small>Specific AZ for deployment (optional)</small>
+                          <small>Specific AZ for deployment</small>
                         </div>
                       </div>
 
@@ -968,7 +1034,28 @@ function App() {
                             </span>
                           )}
                         </dd>
-                        <dt>Version</dt><dd>{selectedDb.version}</dd>
+                        <dt>Version</dt>
+                        <dd>
+                          {selectedDb.version}
+                          <button
+                            onClick={() => {
+                              fetchAvailableUpgrades(selectedDb.id)
+                              setShowUpgradeModal(true)
+                            }}
+                            style={{
+                              marginLeft: '10px',
+                              padding: '2px 8px',
+                              fontSize: '12px',
+                              background: '#3b82f6',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '4px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            Upgrade
+                          </button>
+                        </dd>
                         <dt>Size</dt><dd>{selectedDb.size}</dd>
                         <dt>Storage</dt><dd>{selectedDb.storage_gb} GB</dd>
                       </dl>
@@ -1791,6 +1878,216 @@ function App() {
                         Delete
                       </button>
                     </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Upgrade Modal */}
+      {showUpgradeModal && selectedDb && (
+        <div className="modal-overlay" onClick={() => setShowUpgradeModal(false)}>
+          <div className="modal-content" style={{maxWidth: '600px'}} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Upgrade {selectedDb.name}</h2>
+              <button className="close-btn" onClick={() => setShowUpgradeModal(false)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div style={{
+                display: 'flex',
+                gap: '20px',
+                padding: '16px',
+                background: '#f9fafb',
+                borderRadius: '6px',
+                marginBottom: '20px'
+              }}>
+                <div>
+                  <div style={{fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>Current Version</div>
+                  <div style={{fontSize: '20px', fontWeight: '600', color: '#1f2937'}}>{selectedDb.version}</div>
+                </div>
+                <div style={{fontSize: '24px', color: '#9ca3af', alignSelf: 'center'}}>→</div>
+                <div>
+                  <div style={{fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>Engine</div>
+                  <div style={{fontSize: '16px', fontWeight: '500', color: '#4b5563', textTransform: 'uppercase'}}>{selectedDb.engine}</div>
+                </div>
+              </div>
+
+              {upgradeLoading ? (
+                <div style={{
+                  padding: '40px 20px',
+                  textAlign: 'center',
+                  background: '#f9fafb',
+                  borderRadius: '6px'
+                }}>
+                  <div style={{
+                    width: '40px',
+                    height: '40px',
+                    border: '4px solid #e5e7eb',
+                    borderTop: '4px solid #3b82f6',
+                    borderRadius: '50%',
+                    margin: '0 auto 16px',
+                    animation: 'spin 1s linear infinite'
+                  }}></div>
+                  <div style={{fontSize: '14px', color: '#6b7280'}}>Checking for available upgrades...</div>
+                </div>
+              ) : availableUpgrades.length > 0 ? (
+                <>
+                  <div style={{marginBottom: '20px'}}>
+                    <label htmlFor="upgrade-version" style={{
+                      display: 'block',
+                      fontSize: '14px',
+                      fontWeight: '600',
+                      color: '#374151',
+                      marginBottom: '12px'
+                    }}>
+                      Select Target Version
+                    </label>
+                    <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
+                      {availableUpgrades.map(version => {
+                        const upgradeType = getUpgradeType(selectedDb.version, version)
+                        const isSelected = selectedUpgradeVersion === version
+                        const badgeColors = {
+                          'PATCH': { bg: '#dbeafe', text: '#1e40af', border: '#93c5fd' },
+                          'MINOR': { bg: '#fef3c7', text: '#92400e', border: '#fcd34d' },
+                          'MAJOR': { bg: '#fee2e2', text: '#991b1b', border: '#fca5a5' }
+                        }
+                        const colors = badgeColors[upgradeType]
+                        const upgradeInfo = {
+                          'PATCH': { icon: '🔧', desc: 'Bug fixes and security patches', time: '~5-10 min' },
+                          'MINOR': { icon: '⚡', desc: 'New features, backward compatible', time: '~10-15 min' },
+                          'MAJOR': { icon: '🚀', desc: 'Breaking changes, review required', time: '~15-30 min' }
+                        }
+                        const info = upgradeInfo[upgradeType]
+
+                        return (
+                          <div
+                            key={version}
+                            onClick={() => setSelectedUpgradeVersion(version)}
+                            style={{
+                              padding: '14px',
+                              border: `2px solid ${isSelected ? '#3b82f6' : '#e5e7eb'}`,
+                              borderRadius: '6px',
+                              cursor: 'pointer',
+                              background: isSelected ? '#eff6ff' : 'white',
+                              transition: 'all 0.2s'
+                            }}
+                          >
+                            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'start'}}>
+                              <div style={{flex: 1}}>
+                                <div style={{display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px'}}>
+                                  <span style={{fontSize: '16px', fontWeight: '600', color: '#111827'}}>{version}</span>
+                                  <span style={{
+                                    padding: '3px 10px',
+                                    background: colors.bg,
+                                    color: colors.text,
+                                    border: `1px solid ${colors.border}`,
+                                    borderRadius: '12px',
+                                    fontSize: '11px',
+                                    fontWeight: '600',
+                                    letterSpacing: '0.5px'
+                                  }}>
+                                    {upgradeType}
+                                  </span>
+                                </div>
+                                <div style={{fontSize: '13px', color: '#6b7280', marginBottom: '4px'}}>
+                                  {info.icon} {info.desc}
+                                </div>
+                                <div style={{fontSize: '12px', color: '#9ca3af'}}>
+                                  Estimated time: {info.time}
+                                </div>
+                              </div>
+                              {isSelected && (
+                                <div style={{
+                                  width: '20px',
+                                  height: '20px',
+                                  background: '#3b82f6',
+                                  borderRadius: '50%',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  color: 'white',
+                                  fontSize: '12px',
+                                  fontWeight: '700'
+                                }}>✓</div>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {selectedUpgradeVersion && (
+                    <div style={{
+                      marginBottom: '20px',
+                      padding: '14px',
+                      background: '#fef3c7',
+                      border: '1px solid #f59e0b',
+                      borderRadius: '6px',
+                      fontSize: '13px'
+                    }}>
+                      <div style={{fontWeight: '600', marginBottom: '8px', color: '#92400e'}}>
+                        ⚠️ Before You Upgrade
+                      </div>
+                      <ul style={{margin: '0', paddingLeft: '20px', color: '#78350f', lineHeight: '1.6'}}>
+                        <li>A backup will be created automatically</li>
+                        <li>Temporary downtime expected during upgrade</li>
+                        <li>This operation cannot be undone</li>
+                        <li>Test in non-production first if possible</li>
+                      </ul>
+                    </div>
+                  )}
+
+                  <div style={{display: 'flex', gap: '10px', justifyContent: 'flex-end'}}>
+                    <button
+                      onClick={() => setShowUpgradeModal(false)}
+                      style={{
+                        padding: '10px 20px',
+                        background: '#ffffff',
+                        color: '#374151',
+                        border: '1px solid #d1d5db',
+                        borderRadius: '6px',
+                        cursor: 'pointer',
+                        fontWeight: '500',
+                        fontSize: '14px'
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => upgradeDatabase(selectedDb.id, selectedUpgradeVersion)}
+                      disabled={!selectedUpgradeVersion}
+                      style={{
+                        padding: '10px 24px',
+                        background: selectedUpgradeVersion ? '#3b82f6' : '#9ca3af',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '6px',
+                        cursor: selectedUpgradeVersion ? 'pointer' : 'not-allowed',
+                        fontWeight: '600',
+                        fontSize: '14px',
+                        boxShadow: selectedUpgradeVersion ? '0 1px 2px rgba(0,0,0,0.1)' : 'none'
+                      }}
+                    >
+                      {selectedUpgradeVersion ? `Upgrade to ${selectedUpgradeVersion}` : 'Select a Version'}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div style={{
+                  padding: '40px 20px',
+                  background: '#f9fafb',
+                  borderRadius: '6px',
+                  textAlign: 'center'
+                }}>
+                  <div style={{fontSize: '48px', marginBottom: '12px'}}>✓</div>
+                  <div style={{fontSize: '16px', fontWeight: '600', color: '#1f2937', marginBottom: '8px'}}>
+                    You're Up to Date!
+                  </div>
+                  <div style={{fontSize: '14px', color: '#6b7280'}}>
+                    No newer versions available for {selectedDb.engine} {selectedDb.version}
                   </div>
                 </div>
               )}

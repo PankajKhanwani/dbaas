@@ -20,11 +20,18 @@
 
 Components:
 ├── Frontend (React)          - User Interface
-├── Backend API (FastAPI)     - REST API & Business Logic
-├── MongoDB                   - Metadata Storage
-├── Redis                     - Caching & Rate Limiting
-├── KubeDB Operator           - Database Provisioning
-├── Kubernetes Cluster        - Orchestration Platform
+├── Backend API (FastAPI)     - REST API & Business Logic (Single Pod)
+│   ├── API Server            - FastAPI endpoints
+│   ├── Operation Workers     - Process async operations (3 concurrent)
+│   ├── Reconciliation Worker - Detect & fix drift (leader election)
+│   └── Status Sync Service  - Sync database status from K8s
+├── MongoDB                   - Metadata Storage (databases, operations, audit logs)
+├── Redis                     - Operation Queue & Caching
+├── Multi-Provider Support    - Manage databases across multiple K8s clusters
+│   ├── Provider Management  - Onboard clusters with kubeconfigs
+│   └── Provider Selection   - Auto-select based on resources/region
+├── KubeDB Operator           - Database Provisioning (per cluster)
+├── Kubernetes Clusters       - Multiple clusters (providers)
 └── Managed Databases         - MongoDB, PostgreSQL, MySQL, MariaDB, Redis, ES
 ```
 
@@ -180,11 +187,11 @@ Managed Databases Namespace:
 
 ## Component Architecture
 
-### Backend API (FastAPI) - Detailed View
+### Backend API (FastAPI) - Single Pod Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         BACKEND API POD                                      │
+│                         BACKEND API POD (Single Process)                     │
 │                                                                               │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  FastAPI Application (Uvicorn)                                       │   │
@@ -194,9 +201,11 @@ Managed Databases Namespace:
 │  ┌──────────────────────────┴────────────────────────────────────────────┐ │
 │  │                      API Layer                                         │ │
 │  │  /api/v1/                                                             │ │
+│  │  ├─ /auth          - Authentication & Authorization                   │ │
 │  │  ├─ /databases     - CRUD operations                                  │ │
-│  │  ├─ /credentials   - Get DB credentials                              │ │
-│  │  ├─ /metrics       - Database metrics                                 │ │
+│  │  ├─ /operations    - Operation status & history                       │ │
+│  │  ├─ /providers     - Multi-provider management                        │ │
+│  │  ├─ /tenants       - Tenant management                                │ │
 │  │  ├─ /versions      - Available DB versions                           │ │
 │  │  └─ /health        - Health checks                                    │ │
 │  └──────────────────────────┬────────────────────────────────────────────┘ │
@@ -206,8 +215,15 @@ Managed Databases Namespace:
 │  │                                                                         │ │
 │  │  ┌─────────────────────┐  ┌──────────────────────┐                   │ │
 │  │  │ DatabaseService     │  │  KubeDBService        │                   │ │
-│  │  │ - Business Logic    │  │  - K8s API Client     │                   │ │
-│  │  │ - Validation        │  │  - CRD Management     │                   │ │
+│  │  │ - Business Logic    │  │  - Multi-provider     │                   │ │
+│  │  │ - Validation        │  │  - K8s API Client    │                   │ │
+│  │  │ - Quota Management  │  │  - CRD Management     │                   │ │
+│  │  └─────────────────────┘  └──────────────────────┘                   │ │
+│  │                                                                         │ │
+│  │  ┌─────────────────────┐  ┌──────────────────────┐                   │ │
+│  │  │ ProviderService     │  │  AuditService         │                   │ │
+│  │  │ - Provider CRUD     │  │  - Audit Logging      │                   │ │
+│  │  │ - Kubeconfig Mgmt   │  │  - All Operations     │                   │ │
 │  │  └─────────────────────┘  └──────────────────────┘                   │ │
 │  │                                                                         │ │
 │  │  ┌─────────────────────┐  ┌──────────────────────┐                   │ │
@@ -219,19 +235,40 @@ Managed Databases Namespace:
 │  └──────────────────────────┬────────────────────────────────────────────┘ │
 │                             │                                                │
 │  ┌──────────────────────────┴────────────────────────────────────────────┐ │
-│  │                   Data Layer                                           │ │
+│  │              Background Workers (Same Process)                          │ │
 │  │                                                                         │ │
 │  │  ┌─────────────────────┐  ┌──────────────────────┐                   │ │
-│  │  │  MongoDB (Beanie)   │  │  Redis Client         │                   │ │
-│  │  │  - Database Models  │  │  - Cache Operations   │                   │ │
-│  │  │  - ODM Queries      │  │  - Rate Limit Keys    │                   │ │
+│  │  │ Operation Workers  │  │  Reconciliation      │                   │ │
+│  │  │ (3 concurrent)      │  │  Worker              │                   │ │
+│  │  │ - Process queue     │  │  - Leader Election   │                   │ │
+│  │  │ - Create OpsRequest│  │  - Detect drift      │                   │ │
+│  │  │ - Monitor progress  │  │  - Create operations │                   │ │
 │  │  └─────────────────────┘  └──────────────────────┘                   │ │
 │  │                                                                         │ │
 │  │  ┌─────────────────────┐                                              │ │
-│  │  │  Kubernetes Client  │                                              │ │
-│  │  │  - Custom Resources │                                              │ │
-│  │  │  - Services, Pods   │                                              │ │
-│  │  │  - Secrets          │                                              │ │
+│  │  │  Status Sync Service│                                              │ │
+│  │  │  - Sync from K8s   │                                              │ │
+│  │  │  - Update status   │                                              │ │
+│  │  │  - All pods run    │                                              │ │
+│  │  └─────────────────────┘                                              │ │
+│  └──────────────────────────┬────────────────────────────────────────────┘ │
+│                             │                                                │
+│  ┌──────────────────────────┴────────────────────────────────────────────┐ │
+│  │                   Data Layer                                           │ │
+│  │                                                                         │ │
+│  │  ┌─────────────────────┐  ┌──────────────────────┐                   │ │
+│  │  │  MongoDB (Beanie)   │  │  Redis                │                   │ │
+│  │  │  - Database Models  │  │  - Operation Queue   │                   │ │
+│  │  │  - Operation Models │  │  - Cache              │                   │ │
+│  │  │  - Audit Logs       │  │  - Rate Limiting      │                   │ │
+│  │  │  - Provider Models   │  │                        │                   │ │
+│  │  └─────────────────────┘  └──────────────────────┘                   │ │
+│  │                                                                         │ │
+│  │  ┌─────────────────────┐                                              │ │
+│  │  │  Kubernetes Clients │                                              │ │
+│  │  │  (Per Provider)     │                                              │ │
+│  │  │  - Cached by ID     │                                              │ │
+│  │  │  - TTL-based cleanup│                                              │ │
 │  │  └─────────────────────┘                                              │ │
 │  └─────────────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -354,6 +391,213 @@ Managed Databases Namespace:
 
 ---
 
+## Multi-Provider Architecture
+
+### Provider Management
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      MULTI-PROVIDER ARCHITECTURE                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Provider (Kubernetes Cluster):
+├── Onboarding
+│   ├── POST /api/v1/providers
+│   ├── Upload kubeconfig (content or path)
+│   ├── Specify region, availability zone
+│   ├── Set resource capacity (CPU, memory, storage)
+│   └── Configure reservation limits
+│
+├── Provider Selection
+│   ├── Automatic selection based on:
+│   │   ├─ Resource availability
+│   │   ├─ Region/availability zone
+│   │   ├─ Priority (higher = preferred)
+│   │   ├─ Maintenance status
+│   │   └─ Tags/metadata
+│   └── Manual selection via provider_id
+│
+└── Kubernetes Client Management
+    ├── Per-provider client caching
+    ├── TTL-based cleanup (1 hour default)
+    ├── Automatic reconnection on failure
+    └── SSL verification configurable per provider
+
+Database → Provider Association:
+├── Each database linked to one provider
+├── All operations use provider's kubeconfig
+├── Provider can be changed (migration)
+└── Provider deletion requires database migration
+```
+
+### Provider Resource Management
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PROVIDER RESOURCE TRACKING                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Provider Resource Model:
+├── Total Capacity
+│   ├── cpu_total_cores: 100.0
+│   ├── memory_total_gb: 200.0
+│   └── storage_total_gb: 1000.0
+│
+├── Allocated Resources
+│   ├── cpu_allocated_cores: 45.0 (tracked)
+│   ├── memory_allocated_gb: 90.0 (tracked)
+│   └── storage_allocated_gb: 450.0 (tracked)
+│
+├── Reservation Limits (safety margin)
+│   ├── cpu_reservation_percent: 80% (max 80 cores allocatable)
+│   ├── memory_reservation_percent: 80% (max 160GB allocatable)
+│   └── storage_reservation_percent: 80% (max 800GB allocatable)
+│
+└── Available Resources
+    ├── Available CPU = (100 * 0.8) - 45 = 35 cores
+    ├── Available Memory = (200 * 0.8) - 90 = 70GB
+    └── Available Storage = (1000 * 0.8) - 450 = 350GB
+
+Database Creation Flow:
+1. User requests database with size "db.t3.medium" (2 CPU, 4GB RAM)
+2. ProviderSelector finds providers with available resources
+3. Selects provider with highest priority and sufficient capacity
+4. Creates database in selected provider's cluster
+5. Updates provider's allocated resources
+```
+
+---
+
+## Operation Queue & Workers
+
+### Asynchronous Operation Processing
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    OPERATION QUEUE ARCHITECTURE                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Operation Types:
+├── SCALE_HORIZONTAL    - Change replica count
+├── SCALE_VERTICAL      - Change instance size (CPU/memory)
+├── EXPAND_STORAGE      - Increase storage size
+├── UPGRADE_VERSION     - Upgrade database version
+├── BACKUP              - Create backup
+├── RESTORE             - Restore from backup
+├── PAUSE               - Pause database
+└── RESUME              - Resume paused database
+
+Operation Lifecycle:
+1. API Endpoint
+   ↓ Creates Operation record (status: QUEUED)
+   ↓ Enqueues to Redis queue
+   ↓ Returns operation_id to user
+   
+2. Operation Worker (3 concurrent workers)
+   ↓ Dequeues operation from Redis
+   ↓ Updates status: IN_PROGRESS
+   ↓ Executes operation (creates OpsRequest, monitors)
+   ↓ Updates status: COMPLETED or FAILED
+   
+3. Status Sync Service
+   ↓ Polls K8s for actual state
+   ↓ Updates database.current_* fields
+   ↓ Detects completion
+```
+
+### Operation Worker Details
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      OPERATION WORKER PROCESS                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Operation Worker (3 concurrent instances):
+├── Dequeue from Redis (priority-based)
+├── Process operation:
+│   ├── Get database & provider info
+│   ├── Create KubeDB OpsRequest
+│   ├── Monitor OpsRequest progress
+│   ├── Update operation status
+│   └── Update database state on completion
+│
+└── Error Handling:
+    ├── Retry on transient failures (max 3 retries)
+    ├── Mark as FAILED on permanent errors
+    ├── Log errors for debugging
+    └── Update operation.error_message
+
+Reconciliation Worker (Leader Election):
+├── Only one instance runs (leader)
+├── Detects drift between desired vs current state
+├── Creates operations for:
+│   ├── Replica count changes
+│   ├── Size changes
+│   └── Storage expansion
+└── Runs every 30 seconds (configurable)
+
+Status Sync Service (All Pods):
+├── Runs in all pod instances
+├── Syncs database status from K8s
+├── Updates current_replicas, current_size, current_storage_gb
+├── Updates database version from K8s CR
+└── Runs every 30 seconds (configurable)
+```
+
+---
+
+## Audit Logging
+
+### Comprehensive Operation Tracking
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         AUDIT LOGGING SYSTEM                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Audit Log Model:
+├── action              - Operation type (database.create, database.scale, etc.)
+├── resource_type       - "database", "provider", "tenant"
+├── resource_id         - ID of the resource
+├── domain & project    - Multi-tenancy context
+├── user_id             - User who performed action
+├── user_email          - User email
+├── ip_address          - Request IP
+├── user_agent          - Client user agent
+├── details             - Operation-specific details (JSON)
+├── timestamp           - When action occurred
+└── status              - Success/failure
+
+Audited Operations:
+├── Database Operations
+│   ├── database.create
+│   ├── database.update
+│   ├── database.delete
+│   ├── database.scale
+│   ├── database.pause
+│   ├── database.resume
+│   ├── database.upgrade_version
+│   ├── database.trigger_backup
+│   └── database.restore
+│
+├── Provider Operations
+│   ├── provider.create
+│   ├── provider.update
+│   └── provider.delete
+│
+└── Tenant Operations
+    ├── tenant.create
+    └── tenant.update
+
+Storage:
+├── MongoDB collection: "audit_logs"
+├── Indexed on: action, domain, project, timestamp, resource_type
+├── Retention: Configurable (default: 1 year)
+└── Queryable via API: GET /api/v1/audit-logs
+```
+
+---
+
 ## Data Flow
 
 ### Database Creation Flow
@@ -369,9 +613,12 @@ Managed Databases Namespace:
      │                │                  │                  │                   │
      │ 2. POST /databases                │                  │                   │
      │                ├──────────────────→                  │                   │
-     │                │                  │ 3. Save record   │                   │
+     │                │                  │ 3. Select Provider                  │
+     │                │                  │    (auto-select or manual)           │
+     │                │                  │                  │                   │
+     │                │                  │ 4. Save record   │                   │
      │                │                  ├──────────────────→                   │
-     │                │                  │                  │ 4. Create CRD     │
+     │                │                  │                  │ 5. Create CRD     │
      │                │                  │                  ├───────────────────→
      │                │                  │                  │                   │
      │                │                  │                  │  ┌──────────────┐ │
@@ -380,23 +627,62 @@ Managed Databases Namespace:
      │                │                  │                  │  │ (watches)    │ │
      │                │                  │                  │  └──────┬───────┘ │
      │                │                  │                  │         │         │
-     │                │                  │                  │  5. Provisions    │
+     │                │                  │                  │  6. Provisions    │
      │                │                  │                  │  - StatefulSet    │
      │                │                  │                  │  - Services       │
      │                │                  │                  │  - PVCs           │
      │                │                  │                  │  - Secrets        │
      │                │                  │                  │         │         │
-     │                │ 6. Return 201    │                  │         ▼         │
+     │                │ 7. Return 201    │                  │         ▼         │
      │                │ Created          │                  │  ┌──────────────┐ │
      │                │◀─────────────────┤                  │  │  Database    │ │
-     │ 7. Show success│                  │                  │  │  Running     │ │
+     │ 8. Show success│                  │                  │  │  Running     │ │
      │◀───────────────┤                  │                  │  └──────────────┘ │
      │                │                  │                  │                   │
-     │                │ 8. Poll /status  │                  │                   │
+     │                │ 9. Poll /status  │                  │                   │
      │                ├──────────────────→                  │                   │
-     │                │                  │ 9. Check K8s     │                   │
+     │                │                  │ 10. Status Sync │                   │
+     │                │                  │     (background) │                   │
+     │                │                  │     polls K8s   │                   │
      │                │                  ├──────────────────────────────────────→
      │                │                  │ status           │                   │
+     │                │◀─────────────────┤                  │                   │
+     │ 11. Update UI  │                  │                  │                   │
+     │◀───────────────┤                  │                  │                   │
+```
+
+### Database Scaling Flow (Operation Queue)
+
+```
+┌─────────┐      ┌─────────┐      ┌──────────┐      ┌────────────┐      ┌──────────┐
+│ Browser │ ───→ │ React   │ ───→ │  FastAPI │ ───→ │   Redis    │ ───→ │  Worker  │
+│  (User) │      │   App   │      │    API   │      │   Queue    │      │          │
+└─────────┘      └─────────┘      └──────────┘      └────────────┘      └──────────┘
+     │                │                  │                  │                   │
+     │ 1. Scale Request                  │                  │                   │
+     │    (replicas: 3)                   │                  │                   │
+     ├────────────────→                  │                  │                   │
+     │                │                  │                  │                   │
+     │ 2. POST /scale │                  │                  │                   │
+     │                ├──────────────────→                  │                   │
+     │                │                  │ 3. Create Operation                │
+     │                │                  │    (status: QUEUED)                 │
+     │                │                  │                  │                   │
+     │                │                  │ 4. Enqueue to Redis                │
+     │                │                  ├──────────────────→                   │
+     │                │                  │                  │ 5. Worker dequeues│
+     │                │                  │                  ├───────────────────→
+     │                │                  │                  │                   │
+     │                │ 6. Return 202    │                  │ 6. Process operation│
+     │                │ Accepted          │                  │    - Create OpsRequest│
+     │                │◀─────────────────┤                  │    - Monitor progress│
+     │ 7. Show status │                  │                  │                   │
+     │◀───────────────┤                  │                  │                   │
+     │                │                  │                  │ 7. Update status │
+     │                │                  │                  │    COMPLETED      │
+     │                │ 8. Poll /operations/{id}            │                   │
+     │                ├──────────────────→                  │                   │
+     │                │                  │ 9. Return status │                   │
      │                │◀─────────────────┤                  │                   │
      │ 10. Update UI  │                  │                  │                   │
      │◀───────────────┤                  │                  │                   │
@@ -509,7 +795,7 @@ Performance:
 
 ## Monitoring Architecture
 
-### Metrics Collection (Current Implementation)
+### Metrics Collection & Observability
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -548,48 +834,73 @@ Per Database:
          ▼                       ▼
 ┌─────────────────┐    ┌──────────────────┐
 │  Backend API    │    │  Prometheus      │
-│  (Direct Query) │    │  (Optional)      │
+│  (Direct Query) │    │  (Data Source)   │
 │                 │    │                  │
 │  - On demand    │    │  - Scrapes 15s   │
 │  - With caching │    │  - Historical    │
 │  - Rate limited │    │  - Aggregation   │
-└─────────────────┘    └──────────────────┘
+└─────────────────┘    └────────┬─────────┘
+                                │
+                                ▼
+                    ┌───────────────────────┐
+                    │  Grafana Dashboard     │
+                    │  (Database Monitoring)  │
+                    │                        │
+                    │  Panels:               │
+                    │  ├─ CPU Usage          │
+                    │  ├─ Memory Usage       │
+                    │  ├─ Disk I/O           │
+                    │  ├─ QPS                │
+                    │  ├─ Replication Lag    │
+                    │  ├─ Index Usage        │
+                    │  ├─ Slow Queries       │
+                    │  ├─ Node Health (HA)    │
+                    │  ├─ Backup Status      │
+                    │  └─ Storage Growth     │
+                    │                        │
+                    │  Filter: db-id         │
+                    └───────────────────────┘
 ```
 
-### Optional: Prometheus Integration
+### Grafana Dashboard
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│             ENHANCED MONITORING WITH PROMETHEUS (Optional)                   │
+│                      GRAFANA DASHBOARD FEATURES                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────┐
-│  All Database Stats Services            │
-│  ├─ myapp-db-stats:56790                │
-│  ├─ analytics-db-stats:56790            │
-│  ├─ cache-db-stats:56790                │
-│  └─ ... (100s of databases)             │
-└────────────┬────────────────────────────┘
-             │ ServiceMonitor
-             │ (Auto-discovery)
-             ▼
-┌─────────────────────────────────────────┐
-│  Prometheus Server                      │
-│  - Scrapes every 15s                    │
-│  - Stores time-series (15 days)         │
-│  - Retention: 15d                       │
-│  - Query: PromQL                        │
-└────────────┬────────────────────────────┘
-             │
-             ├─────────────┬─────────────┬──────────────┐
-             ▼             ▼             ▼              ▼
-    ┌─────────────┐ ┌───────────┐ ┌──────────┐ ┌────────────┐
-    │  Backend    │ │  Grafana  │ │ Alert   │ │  Thanos    │
-    │  API        │ │  (Viz)    │ │ Manager │ │  (Storage) │
-    │             │ │           │ │         │ │            │
-    │  Production │ │  Explore  │ │  Slack  │ │  Long-term │
-    │  Caching    │ │  Dashbds  │ │  PagerD │ │  Retention │
-    └─────────────┘ └───────────┘ └─────────┘ └────────────┘
+Dashboard: Database Monitoring
+├── Template Variable: db-id
+│   └── Dropdown to select database by ID
+│
+├── Panels (13 total):
+│   ├── CPU Usage (%) - Per pod CPU utilization
+│   ├── Memory Usage (GB) - Memory consumption
+│   ├── Disk I/O Read (MB/s) - Read throughput
+│   ├── Disk I/O Write (MB/s) - Write throughput
+│   ├── Queries Per Second (QPS) - Database query rate
+│   ├── Replication Lag (seconds) - HA replication delay
+│   ├── Index Usage - Index count and usage
+│   ├── Slow Queries (per second) - Performance issues
+│   ├── Node Health (HA) - Healthy vs total replicas
+│   ├── Backup Job Success/Failure - Backup status
+│   ├── Storage Consumption (GB) - Current usage
+│   └── Storage Growth Rate (GB/hour) - Capacity planning
+│
+├── Multi-Engine Support:
+│   ├── MongoDB - mongodb_op_counters_total, mongodb_mongod_replset_*
+│   ├── PostgreSQL - pg_stat_database_*, pg_replication_*
+│   ├── MySQL - mysql_global_status_*, mysql_slave_status_*
+│   └── Redis, Elasticsearch - Engine-specific metrics
+│
+└── Features:
+    ├── Auto-refresh (30 seconds)
+    ├── Alerting (replication lag threshold)
+    ├── Flexible queries (pod name pattern + label-based)
+    └── Prometheus data source integration
+
+Location: k8s/monitoring/grafana-dashboard-database.json
+Deployment: ConfigMap or Grafana API import
 ```
 
 ---
@@ -770,7 +1081,19 @@ Backend:
 ├─ ASGI Server: Uvicorn
 ├─ ODM: Beanie (MongoDB)
 ├─ K8s Client: kubernetes-asyncio
-└─ Caching: Redis (aioredis)
+├─ Caching: Redis (aioredis)
+├─ Queue: Redis (operation queue)
+├─ Workers: Operation Worker (3x), Reconciliation Worker, Status Sync
+├─ Leader Election: Redis-based (for reconciliation)
+└─ Services:
+    ├─ DatabaseService - Business logic & validation
+    ├─ KubeDBService - Multi-provider K8s integration
+    ├─ ProviderService - Provider management
+    ├─ AuditService - Audit logging
+    ├─ MetricsService - Metrics collection
+    ├─ MetricsCacheService - Multi-layer caching
+    ├─ PrometheusService - PromQL queries
+    └─ TenantService - Tenant & quota management
 
 Infrastructure:
 ├─ Orchestration: Kubernetes 1.28+
@@ -828,17 +1151,30 @@ Availability Zone 1          Availability Zone 2          Availability Zone 3
 
 **Key Features:**
 - ✅ Multi-tenant isolation (domain/project)
-- ✅ Production-grade monitoring (100K+ users)
+- ✅ Multi-provider architecture (manage multiple K8s clusters)
+- ✅ Single pod architecture (all workers in one process)
+- ✅ Asynchronous operation processing (Redis queue)
+- ✅ Comprehensive audit logging (all operations tracked)
+- ✅ Production-grade monitoring (Grafana dashboard)
 - ✅ Multi-layer caching (Memory → Redis)
 - ✅ High availability (multi-AZ)
 - ✅ Auto-scaling (HPA)
 - ✅ Network isolation (NetworkPolicies)
 - ✅ Secure credentials (K8s Secrets)
 - ✅ Disaster recovery (backups)
+- ✅ Leader election (reconciliation worker)
+- ✅ Status synchronization (all pods)
 
 **Supported Databases:**
 - MongoDB, PostgreSQL, MySQL, MariaDB, Redis, Elasticsearch
 
+**Architecture Highlights:**
+- Single pod runs: API server, 3 operation workers, reconciliation worker, status sync
+- Multi-provider: Each database linked to a provider (K8s cluster)
+- Operation queue: Redis-based queue for async operations
+- Audit logging: All DBaaS operations logged with user context
+- Grafana dashboard: 13 panels for comprehensive database monitoring
+
 **Deployment Modes:**
 - Development (local K8s with port-forwards)
-- Production (in-cluster, multi-AZ, HA)
+- Production (in-cluster, multi-AZ, HA, multi-provider)

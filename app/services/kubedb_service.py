@@ -322,7 +322,7 @@ class KubeDBService:
 
         # Fetch provider document to get kubeconfig_content and verify_ssl
         from app.repositories.models import Provider
-        provider = await Provider.find_one(Provider.id == provider_id)
+        provider = await Provider.find_one({"_id": provider_id})
 
         if not provider:
             raise KubernetesError(
@@ -702,14 +702,38 @@ class KubeDBService:
         """
         Build MongoDB custom resource spec.
 
-        MongoDB is ALWAYS created in replicaSet mode to allow future scaling.
-        Even single-replica instances use replicaSet topology.
+        For 1 replica: Standalone mode (no replicaSet) - single instance, not scalable
+        For 2 replicas: Force to 3 (ReplicaSet needs odd number for quorum)
+        For 3+ replicas: ReplicaSet mode - scalable and highly available
+
+        Note: Scaling from Standalone (1) to ReplicaSet (3+) requires database recreation.
         """
         resources = self._get_resource_limits(size)
 
+        # Determine topology based on replicas
+        # ReplicaSet requires minimum 3 replicas for proper quorum
+        if replicas == 1:
+            # Standalone mode - single instance, no replicaSet
+            effective_replicas = 1
+            use_replicaset = False
+        elif replicas == 2:
+            # ReplicaSet needs odd number for quorum, force to 3
+            logger.warning(
+                "mongodb_replicas_adjusted",
+                requested=2,
+                effective=3,
+                reason="ReplicaSet requires odd number (minimum 3) for quorum"
+            )
+            effective_replicas = 3
+            use_replicaset = True
+        else:
+            # 3+ replicas - use replicaSet
+            effective_replicas = replicas
+            use_replicaset = True
+
         spec = {
             "version": version,
-            "replicas": replicas,
+            "replicas": effective_replicas,
             "storage": {
                 "accessModes": ["ReadWriteOnce"],
                 "resources": {"requests": {"storage": f"{storage_gb}Gi"}},
@@ -757,9 +781,11 @@ class KubeDBService:
                 }
             },
             "terminationPolicy": "WipeOut",
-            # ALWAYS use replicaSet mode for scalability
-            "replicaSet": {"name": f"{name}-replicaset"},
         }
+
+        # Only add replicaSet configuration if using replicaSet mode
+        if use_replicaset:
+            spec["replicaSet"] = {"name": f"{name}-replicaset"}
 
         # Add storage class if provided
         if storage_class:
@@ -1424,6 +1450,28 @@ class KubeDBService:
         # Get recent events for better error visibility
         events = await self._get_resource_events(name, namespace, provider_id=provider_id)
 
+        # Extract version from spec (version field in KubeDB resources)
+        # Version is typically at spec.version for most KubeDB engines
+        version = spec.get("version")
+        
+        # Log version extraction for debugging
+        if version:
+            logger.debug(
+                "version_extracted_from_kubedb_resource",
+                name=name,
+                namespace=namespace,
+                engine=engine.value if hasattr(engine, 'value') else engine,
+                version=version,
+            )
+        else:
+            logger.warning(
+                "version_not_found_in_kubedb_resource",
+                name=name,
+                namespace=namespace,
+                engine=engine.value if hasattr(engine, 'value') else engine,
+                spec_keys=list(spec.keys()) if spec else [],
+            )
+        
         return {
             "phase": status.get("phase", "Unknown"),
             "conditions": status.get("conditions", []),
@@ -1432,6 +1480,7 @@ class KubeDBService:
             "ready": self._is_database_ready(status),
             "replicas": desired_replicas,
             "ready_replicas": ready_replicas,
+            "version": version,  # Current version from KubeDB resource
         }
 
     async def _get_resource_events(
@@ -1673,6 +1722,11 @@ class KubeDBService:
 
                 # Patch storage directly (Kubernetes handles PVC expansion)
                 patch_body = {
+                    "metadata": {
+                        "labels": {
+                            "app.kubernetes.io/managed-by": "kubedb-dbaas"
+                        }
+                    },
                     "spec": {
                         "storage": {
                             "resources": {
@@ -3299,6 +3353,358 @@ class KubeDBService:
                 exc_info=True,
             )
             raise KubernetesError(f"Failed to fetch versions for {engine.value}: {str(e)}")
+
+    # ===============================================================================
+    # VERSION UPGRADE METHODS
+    # ===============================================================================
+
+    async def get_versions_by_region(
+        self, engine: str, region: Optional[str] = None, availability_zone: Optional[str] = None
+    ) -> list[Dict[str, Any]]:
+        """
+        Get available versions for a specific database engine from a provider by region/AZ.
+
+        Args:
+            engine: Database engine type (postgres, mysql, mongodb, etc.)
+            region: Optional region filter
+            availability_zone: Optional AZ filter
+
+        Returns:
+            List of available version dictionaries with version details
+
+        Raises:
+            ValueError: If engine is invalid or provider not found
+            KubernetesError: If failed to fetch versions
+        """
+        from app.models.database import DatabaseEngine
+
+        try:
+            # Validate engine
+            try:
+                db_engine = DatabaseEngine(engine.lower())
+            except ValueError:
+                raise ValueError(f"Invalid database engine: {engine}")
+
+            # Get provider for region/AZ
+            from app.services.provider_service import provider_service
+
+            providers = await provider_service.list_providers(
+                region=region,
+                availability_zone=availability_zone,
+                is_active=True,
+                skip=0,
+                limit=1,
+            )
+
+            if not providers:
+                logger.warning(
+                    "no_providers_found_for_versions",
+                    engine=engine,
+                    region=region,
+                    az=availability_zone,
+                )
+                return []
+
+            provider = providers[0]
+            provider_id = provider.id
+
+            logger.info(
+                "fetching_versions_for_engine",
+                engine=engine,
+                provider_id=provider_id,
+            )
+
+            # Fetch versions using get_available_versions
+            result = await self.get_available_versions(
+                engine=db_engine, provider_id=provider_id
+            )
+
+            return result.get("versions", [])
+
+        except Exception as e:
+            logger.error(
+                "error_fetching_available_versions",
+                engine=engine,
+                error=str(e),
+                exc_info=True,
+            )
+            raise
+
+    async def upgrade_database_version(
+        self,
+        domain: str,
+        project: str,
+        database_id: str,
+        target_version: str,
+        skip_backup: bool = False,
+    ) -> str:
+        """
+        Upgrade a database to a new version using KubeDB OpsRequest.
+
+        Creates a version update OpsRequest that upgrades the database.
+        Supports patch, minor, and major version upgrades (if allowed by KubeDB).
+
+        Args:
+            domain: Domain name
+            project: Project name
+            database_id: Database unique identifier
+            target_version: Target version to upgrade to
+            skip_backup: Whether to skip pre-upgrade backup
+
+        Returns:
+            Operation ID (OpsRequest name) for tracking upgrade progress
+
+        Raises:
+            ValueError: If database not found or invalid upgrade
+            KubernetesError: If OpsRequest creation fails
+        """
+        from app.services.database_service import database_service
+        from app.utils.version import (
+            is_upgrade_compatible,
+            get_upgrade_type,
+            UpgradeType,
+        )
+
+        logger.info(
+            "upgrading_database_version",
+            database_id=database_id,
+            domain=domain,
+            project=project,
+            target_version=target_version,
+        )
+
+        # Get database document directly from MongoDB to access all fields
+        from app.repositories.models import Database
+        db = await Database.find_one({"_id": database_id, "domain": domain, "project": project})
+        if not db:
+            raise ValueError(f"Database not found: {database_id}")
+
+        # Use kubedb_resource_name (the actual K8s resource name) not name (user-friendly name)
+        db_name = db.kubedb_resource_name
+        current_version = db.version
+        engine = db.engine
+        provider_id = db.provider_id
+        namespace = db.namespace or "default"
+
+        # Validate upgrade compatibility
+        is_compatible, reason = is_upgrade_compatible(
+            current_version, target_version, allow_major=True
+        )
+
+        if not is_compatible:
+            raise ValueError(f"Incompatible upgrade: {reason}")
+
+        upgrade_type = get_upgrade_type(current_version, target_version)
+
+        logger.info(
+            "upgrade_validation_passed",
+            database_id=database_id,
+            current_version=current_version,
+            target_version=target_version,
+            upgrade_type=upgrade_type.value,
+        )
+
+        # Get kubeconfig for provider
+        from app.repositories.models import Provider
+        provider = await Provider.find_one({"_id": provider_id})
+        if not provider:
+            raise ValueError(f"Provider {provider_id} not found")
+        kubeconfig_content = provider.kubeconfig_content
+        if not kubeconfig_content:
+            raise ValueError(f"kubeconfig_content is required for provider {provider_id}")
+
+        # Generate OpsRequest name
+        import time
+        timestamp = int(time.time())
+        ops_request_name = f"{db_name}-upgrade-{timestamp}"
+
+        # Create OpsRequest spec based on engine type
+        ops_request = await self._create_version_upgrade_ops_request(
+            engine=engine,
+            db_name=db_name,
+            namespace=namespace,
+            ops_request_name=ops_request_name,
+            target_version=target_version,
+            upgrade_type=upgrade_type,
+        )
+
+        # Create the OpsRequest in Kubernetes
+        try:
+            # Convert engine enum to string if needed
+            engine_str = engine.value if hasattr(engine, 'value') else str(engine)
+            await self._create_ops_request(
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+                ops_request=ops_request,
+                namespace=namespace,
+                engine=engine_str,
+            )
+
+            logger.info(
+                "version_upgrade_ops_request_created",
+                database_id=database_id,
+                ops_request_name=ops_request_name,
+                target_version=target_version,
+                upgrade_type=upgrade_type.value,
+            )
+
+            return ops_request_name
+
+        except Exception as e:
+            logger.error(
+                "failed_to_create_upgrade_ops_request",
+                database_id=database_id,
+                ops_request_name=ops_request_name,
+                error=str(e),
+                exc_info=True,
+            )
+            raise KubernetesError(f"Failed to create upgrade OpsRequest: {str(e)}")
+
+    async def _create_version_upgrade_ops_request(
+        self,
+        engine: str,
+        db_name: str,
+        namespace: str,
+        ops_request_name: str,
+        target_version: str,
+        upgrade_type,
+    ) -> Dict[str, Any]:
+        """
+        Create version upgrade OpsRequest spec for a database engine.
+
+        Args:
+            engine: Database engine type
+            db_name: Database resource name
+            namespace: Kubernetes namespace
+            ops_request_name: Name for the OpsRequest
+            target_version: Target version to upgrade to
+            upgrade_type: Type of upgrade (patch/minor/major)
+
+        Returns:
+            OpsRequest spec dictionary
+        """
+        # Map engine to KubeDB resource kind and OpsRequest kind
+        engine_map = {
+            "postgres": ("Postgres", "PostgresOpsRequest"),
+            "mysql": ("MySQL", "MySQLOpsRequest"),
+            "mongodb": ("MongoDB", "MongoDBOpsRequest"),
+            "redis": ("Redis", "RedisOpsRequest"),
+            "elasticsearch": ("Elasticsearch", "ElasticsearchOpsRequest"),
+        }
+
+        if engine not in engine_map:
+            raise ValueError(f"Unsupported engine for version upgrade: {engine}")
+
+        db_kind, ops_kind = engine_map[engine]
+
+        logger.info(
+            "creating_version_upgrade_ops_request_spec",
+            engine=engine,
+            db_name=db_name,
+            target_version=target_version,
+            upgrade_type=upgrade_type.value,
+        )
+
+        # Base OpsRequest structure
+        ops_request = {
+            "apiVersion": "ops.kubedb.com/v1alpha1",
+            "kind": ops_kind,
+            "metadata": {
+                "name": ops_request_name,
+                "namespace": namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "kubedb-dbaas",
+                    "dbaas.kubedb.com/operation-type": "version-upgrade",
+                    "dbaas.kubedb.com/upgrade-type": upgrade_type.value,
+                },
+            },
+            "spec": {
+                "type": "UpdateVersion",
+                "databaseRef": {"name": db_name},
+                "updateVersion": {"targetVersion": target_version},
+            },
+        }
+
+        # Add apply policy based on upgrade type
+        # For major upgrades, use IfReady (more cautious)
+        # For minor/patch, can use Always
+        if upgrade_type.value == "major":
+            ops_request["spec"]["apply"] = "IfReady"
+        else:
+            ops_request["spec"]["apply"] = "Always"
+
+        return ops_request
+
+    async def _create_ops_request(
+        self,
+        provider_id: Optional[str],
+        kubeconfig_content: str,
+        ops_request: Dict[str, Any],
+        namespace: str,
+        engine: str,
+    ):
+        """
+        Create a KubeDB OpsRequest in the cluster.
+
+        Args:
+            provider_id: Provider ID for getting the client
+            kubeconfig_content: Kubeconfig YAML content
+            ops_request: OpsRequest spec dictionary
+            namespace: Kubernetes namespace
+            engine: Database engine type
+
+        Raises:
+            KubernetesError: If creation fails
+        """
+        # Map engine to API group
+        engine_group_map = {
+            "postgres": "ops.kubedb.com",
+            "mysql": "ops.kubedb.com",
+            "mongodb": "ops.kubedb.com",
+            "redis": "ops.kubedb.com",
+            "elasticsearch": "ops.kubedb.com",
+        }
+
+        group = engine_group_map.get(engine, "ops.kubedb.com")
+        version = "v1alpha1"
+        plural_map = {
+            "postgres": "postgresopsrequests",
+            "mysql": "mysqlopsrequests",
+            "mongodb": "mongodbopsrequests",
+            "redis": "redisopsrequests",
+            "elasticsearch": "elasticsearchopsrequests",
+        }
+        plural = plural_map.get(engine, f"{engine}opsrequests")
+
+        # Get Kubernetes client for this provider
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+
+        try:
+            await client_set.custom_api.create_namespaced_custom_object(
+                group=group,
+                version=version,
+                namespace=namespace,
+                plural=plural,
+                body=ops_request,
+            )
+
+            logger.info(
+                "ops_request_created_successfully",
+                name=ops_request["metadata"]["name"],
+                namespace=namespace,
+                engine=engine,
+            )
+
+        except ApiException as e:
+            logger.error(
+                "api_exception_creating_ops_request",
+                name=ops_request["metadata"]["name"],
+                namespace=namespace,
+                status=e.status,
+                reason=e.reason,
+                body=e.body,
+            )
+            raise KubernetesError(f"Failed to create OpsRequest: {e.reason}")
 
 
 # Global instance

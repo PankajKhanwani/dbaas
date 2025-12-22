@@ -136,12 +136,26 @@ class ReconciliationWorker:
                 if not self.running:
                     logger.info("reconciliation_stopped_during_execution")
                     return
-                    
+
                 try:
                     await self._reconcile_provider_databases(provider)
                 except Exception as e:
                     logger.error(
                         "provider_reconciliation_failed",
+                        provider_id=provider.id,
+                        error=str(e),
+                    )
+                    continue
+
+            # Cleanup old OpsRequests across all providers
+            for provider in providers:
+                if not self.running:
+                    return
+                try:
+                    await self._cleanup_old_ops_requests(provider)
+                except Exception as e:
+                    logger.error(
+                        "ops_request_cleanup_failed",
                         provider_id=provider.id,
                         error=str(e),
                     )
@@ -199,6 +213,7 @@ class ReconciliationWorker:
         2. Update current_* fields in database record
         3. Compare desired state (size, replicas, storage_gb) vs current state
         4. Create operations if drift detected
+        5. If resource doesn't exist in K8s, mark database as deleted
         """
         try:
             # Get kubeconfig
@@ -209,13 +224,40 @@ class ReconciliationWorker:
                 provider.id, kubeconfig_content
             )
 
-            current_cr = await client_set.custom_api.get_namespaced_custom_object(
-                group=kubedb_service._get_kubedb_group(db.engine),
-                version=kubedb_service._get_kubedb_version(db.engine),
-                namespace=db.namespace,
-                plural=kubedb_service._get_kubedb_plural(db.engine),
-                name=db.kubedb_resource_name,
-            )
+            try:
+                current_cr = await client_set.custom_api.get_namespaced_custom_object(
+                    group=kubedb_service._get_kubedb_group(db.engine),
+                    version=kubedb_service._get_kubedb_version(db.engine),
+                    namespace=db.namespace,
+                    plural=kubedb_service._get_kubedb_plural(db.engine),
+                    name=db.kubedb_resource_name,
+                )
+            except Exception as e:
+                # Check if resource was deleted (404 Not Found)
+                error_str = str(e).lower()
+                if "404" in error_str or "not found" in error_str:
+                    logger.info(
+                        "database_resource_not_found_marking_deleted",
+                        database_id=db.id,
+                        database_name=db.name,
+                        kubedb_resource_name=db.kubedb_resource_name,
+                        namespace=db.namespace,
+                        engine=db.engine.value,
+                        message="KubeDB resource no longer exists, marking database as DELETED",
+                    )
+
+                    # Mark database as deleted
+                    await Database.find_one({"_id": db.id}).update({
+                        "$set": {
+                            "status": DatabaseStatus.DELETED.value,
+                            "updated_at": datetime.utcnow(),
+                        }
+                    })
+
+                    return  # Skip rest of reconciliation
+                else:
+                    # Re-raise if it's not a 404
+                    raise
 
             # STEP 1: Sync current state from KubeDB CR
             cr_replicas = current_cr.get("spec", {}).get("replicas", 1)
@@ -367,12 +409,13 @@ class ReconciliationWorker:
         flow as user-initiated operations.
         """
         try:
-            # IMPORTANT: Check if an operation already exists for this database and type
+            # IMPORTANT: Check if ANY operation already exists for this database
             # This prevents creating duplicate operations when reconciliation runs
             # while an operation is still pending or in progress
+            # NOTE: KubeDB can only process ONE OpsRequest at a time, so we check for
+            # ANY active operation, not just operations of the same type
             existing = await Operation.find_one({
                 "database_id": db.id,
-                "type": operation_type,
                 "status": {"$in": [
                     OperationStatus.QUEUED.value,
                     OperationStatus.IN_PROGRESS.value,
@@ -385,7 +428,9 @@ class ReconciliationWorker:
                     database_id=db.id,
                     operation_type=operation_type.value,
                     existing_operation_id=str(existing.id),
+                    existing_operation_type=existing.type.value,
                     existing_status=existing.status.value,
+                    message="KubeDB can only process one OpsRequest at a time, waiting for active operation to complete",
                 )
                 return  # Skip creating duplicate
 
@@ -495,6 +540,109 @@ class ReconciliationWorker:
 
         # If no exact match, return None (will be detected as drift)
         return None
+
+    async def _cleanup_old_ops_requests(self, provider: Provider):
+        """
+        Clean up old completed OpsRequests for all databases in this provider.
+
+        Keeps the 3 most recent OpsRequests per database and deletes older ones
+        in terminal states (Successful, Failed, Skipped).
+        """
+        try:
+            kubeconfig_content = provider.kubeconfig_content
+            client_set = await kubedb_service.get_client_for_provider(
+                provider.id, kubeconfig_content
+            )
+
+            # Get all databases for this provider (including DELETED ones)
+            databases = await Database.find({"provider_id": provider.id}).to_list()
+
+            terminal_phases = ["Successful", "Failed", "Skipped"]
+            total_cleaned = 0
+
+            for db in databases:
+                if not self.running:
+                    return
+
+                try:
+                    # Get all OpsRequests for this database
+                    items = await client_set.custom_api.list_namespaced_custom_object(
+                        group="ops.kubedb.com",
+                        version="v1alpha1",
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_ops_request_plural(db.engine),
+                        label_selector=f"app.kubernetes.io/instance={db.kubedb_resource_name}",
+                    )
+
+                    ops_list = items.get("items", [])
+
+                    # Sort by creation timestamp (newest first)
+                    ops_list.sort(
+                        key=lambda x: x.get("metadata", {}).get("creationTimestamp", ""),
+                        reverse=True,
+                    )
+
+                    # Keep the 3 most recent, cleanup the rest if they're terminal
+                    if len(ops_list) > 3:
+                        old_ops_requests = [
+                            item for item in ops_list[3:]
+                            if item.get("status", {}).get("phase") in terminal_phases
+                        ]
+
+                        for old_ops in old_ops_requests:
+                            if not self.running:
+                                return
+
+                            try:
+                                ops_name = old_ops["metadata"]["name"]
+                                await client_set.custom_api.delete_namespaced_custom_object(
+                                    group="ops.kubedb.com",
+                                    version="v1alpha1",
+                                    namespace=db.namespace,
+                                    plural=kubedb_service._get_ops_request_plural(db.engine),
+                                    name=ops_name,
+                                )
+                                total_cleaned += 1
+                                logger.debug(
+                                    "cleaned_up_old_ops_request",
+                                    database_id=db.id,
+                                    database_name=db.name,
+                                    ops_request_name=ops_name,
+                                    phase=old_ops.get("status", {}).get("phase"),
+                                )
+                            except Exception as e:
+                                error_str = str(e).lower()
+                                if "404" not in error_str and "not found" not in error_str:
+                                    logger.warning(
+                                        "failed_to_delete_ops_request",
+                                        ops_request_name=old_ops["metadata"]["name"],
+                                        error=str(e),
+                                    )
+
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "404" not in error_str and "not found" not in error_str:
+                        logger.debug(
+                            "cleanup_check_failed_for_database",
+                            database_id=db.id,
+                            database_name=db.name,
+                            error=str(e),
+                        )
+
+            if total_cleaned > 0:
+                logger.info(
+                    "ops_requests_cleanup_completed",
+                    provider_id=provider.id,
+                    total_cleaned=total_cleaned,
+                )
+
+        except Exception as e:
+            logger.error(
+                "ops_request_cleanup_failed",
+                provider_id=provider.id,
+                error=str(e),
+                exc_info=True,
+            )
 
 
 # Main entry point

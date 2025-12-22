@@ -201,6 +201,8 @@ class OperationWorker:
                 await self.process_scale_horizontal(operation, db)
             elif operation.type == OperationType.EXPAND_STORAGE:
                 await self.process_expand_storage(operation, db)
+            elif operation.type == OperationType.UPGRADE_VERSION:
+                await self.process_upgrade_version(operation, db)
             else:
                 raise ValueError(f"Unsupported operation type: {operation.type}")
 
@@ -212,10 +214,11 @@ class OperationWorker:
             await operation.save()
 
             # Update current state in database record to match desired state
-            # IMPORTANT: For horizontal scaling, don't update current_replicas here!
-            # The OpsRequest is async and takes time. The status sync service
-            # will update current_replicas when the CR actually changes.
-            if operation.type != OperationType.SCALE_HORIZONTAL:
+            # IMPORTANT: 
+            # - Horizontal scaling: current_replicas is updated in process_scale_horizontal after OpsRequest completes
+            # - Version upgrades: version is updated in process_upgrade_version after OpsRequest completes
+            # - Other operations: update current state here
+            if operation.type not in [OperationType.SCALE_HORIZONTAL, OperationType.UPGRADE_VERSION]:
                 await self._update_current_state_after_operation(db, operation)
 
             # Clean up OpsRequest if it was created (for vertical scaling)
@@ -390,13 +393,12 @@ class OperationWorker:
         provider_id, kubeconfig_content = await db_service._get_provider_kubeconfig(db)
 
         # Update progress
-        operation.progress = 20
-        operation.message = "Updating replicas"
+        operation.progress = 10
+        operation.message = "Creating horizontal scaling OpsRequest"
         await operation.save()
 
-        # Create OpsRequest for horizontal scaling (fire-and-forget)
-        # The status sync service will monitor the OpsRequest and update current_replicas
-        await kubedb_service.patch_database(
+        # Create OpsRequest for horizontal scaling
+        result = await kubedb_service.patch_database(
             engine=db.engine,
             name=db.kubedb_resource_name,
             namespace=db.namespace,
@@ -405,13 +407,63 @@ class OperationWorker:
             kubeconfig_content=kubeconfig_content,
         )
 
-        # NOTE: Don't update db.replicas (desired state) - it's already set by API!
-        # NOTE: Don't update db.current_replicas here - OpsRequest is async!
-        # The status sync service will update current_replicas when CR changes.
+        # Extract OpsRequest name from result
+        ops_request_name = result.get("ops_request_name") if isinstance(result, dict) else None
+        if ops_request_name:
+            operation.ops_request_name = ops_request_name
+            operation.message = f"Monitoring OpsRequest: {ops_request_name}"
+            await operation.save()
 
-        operation.progress = 100
-        operation.message = "HorizontalScaling OpsRequest created"
-        await operation.save()
+            # Monitor OpsRequest progress (like vertical scaling)
+            ops_start_time = datetime.now(timezone.utc)
+            await self.monitor_ops_request(
+                operation=operation,
+                db=db,
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+                timeout=600,  # 10 minutes
+            )
+
+            # Record OpsRequest completion metric
+            ops_duration = (datetime.now(timezone.utc) - ops_start_time).total_seconds()
+            final_phase = operation.ops_request_phase or "Successful"
+            metrics.record_ops_request_complete(
+                db.engine.value, "horizontal_scaling", final_phase, ops_duration
+            )
+
+            # After OpsRequest completes, update current_replicas to match spec.replicas
+            # This ensures reconciler won't detect false drift
+            if operation.ops_request_phase in ["Successful", "Skipped"]:
+                # Fetch the actual CR to get the final spec.replicas value
+                client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                try:
+                    current_cr = await client_set.custom_api.get_namespaced_custom_object(
+                        group=kubedb_service._get_kubedb_group(db.engine),
+                        version=kubedb_service._get_kubedb_version(db.engine),
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_kubedb_plural(db.engine),
+                        name=db.kubedb_resource_name,
+                    )
+                    cr_replicas = current_cr.get("spec", {}).get("replicas", db.replicas)
+                    db.current_replicas = cr_replicas
+                    await db.save()
+                    logger.info(
+                        "current_replicas_updated_after_horizontal_scaling",
+                        database_id=db.id,
+                        current_replicas=cr_replicas,
+                        desired_replicas=db.replicas,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "failed_to_update_current_replicas_after_scaling",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+        else:
+            # Fallback if OpsRequest name not returned
+            operation.progress = 100
+            operation.message = "HorizontalScaling OpsRequest created"
+            await operation.save()
 
     async def process_expand_storage(self, operation: Operation, db: Database):
         """Process storage expansion operation."""
@@ -448,6 +500,100 @@ class OperationWorker:
         operation.progress = 100
         operation.message = "Storage expanded"
         await operation.save()
+
+    async def process_upgrade_version(self, operation: Operation, db: Database):
+        """Process version upgrade operation."""
+        logger.info(
+            "processing_version_upgrade",
+            operation_id=operation.id,
+            database_id=db.id,
+            target_version=operation.desired_state.get("target_version"),
+        )
+
+        # Get provider credentials
+        db_service = DatabaseService()
+        provider_id, kubeconfig_content = await db_service._get_provider_kubeconfig(db)
+
+        # OpsRequest should already be created by the API endpoint
+        if not operation.ops_request_name:
+            raise ValueError("OpsRequest name not found in operation. Upgrade may not have been initiated correctly.")
+
+        # Update progress
+        operation.progress = 20
+        operation.message = "Monitoring upgrade OpsRequest"
+        await operation.save()
+
+        # Monitor OpsRequest until completion
+        ops_start_time = datetime.now(timezone.utc)
+        await self.monitor_ops_request(
+            operation=operation,
+            db=db,
+            provider_id=provider_id,
+            kubeconfig_content=kubeconfig_content,
+            timeout=1800,  # 30 minutes for version upgrades
+        )
+
+        # Record OpsRequest completion metric
+        ops_duration = (datetime.now(timezone.utc) - ops_start_time).total_seconds()
+        final_phase = operation.ops_request_phase or "Successful"
+        metrics.record_ops_request_complete(
+            db.engine.value, "version_upgrade", final_phase, ops_duration
+        )
+
+        # Update database version after successful upgrade
+        # Read the actual version from KubeDB resource to ensure accuracy
+        if final_phase == "Successful":
+            try:
+                # Get the actual version from KubeDB resource
+                resource = await kubedb_service.get_database(
+                    engine=db.engine,
+                    name=db.kubedb_resource_name,
+                    namespace=db.namespace,
+                    provider_id=provider_id,
+                    kubeconfig_content=kubeconfig_content,
+                )
+                if resource:
+                    actual_version = resource.get("spec", {}).get("version")
+                    if actual_version:
+                        old_version = db.version
+                        db.version = actual_version
+                        await db.save()
+                        logger.info(
+                            "database_version_updated_after_upgrade",
+                            database_id=db.id,
+                            old_version=old_version,
+                            new_version=actual_version,
+                            target_version=operation.desired_state.get("target_version"),
+                        )
+                    else:
+                        logger.warning(
+                            "version_not_found_in_kubedb_resource",
+                            database_id=db.id,
+                            message="Version field not found in KubeDB resource spec",
+                        )
+                else:
+                    logger.warning(
+                        "kubedb_resource_not_found_for_version_update",
+                        database_id=db.id,
+                    )
+            except Exception as e:
+                logger.error(
+                    "failed_to_update_version_after_upgrade",
+                    database_id=db.id,
+                    error=str(e),
+                    exc_info=True,
+                )
+                # Fallback: use target version from operation
+                target_version = operation.desired_state.get("target_version")
+                if target_version:
+                    db.version = target_version
+                    await db.save()
+                    logger.info(
+                        "database_version_updated_from_target",
+                        database_id=db.id,
+                        new_version=target_version,
+                        message="Used target version as fallback",
+                    )
 
     async def monitor_ops_request(
         self,

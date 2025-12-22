@@ -52,6 +52,50 @@ class BackupSchedule(str, Enum):
     WEEKLY = "weekly"
 
 
+class UpgradeStrategy(str, Enum):
+    """Version upgrade strategy."""
+
+    DISABLED = "disabled"  # No automatic upgrades
+    LATEST_PATCH = "latest_patch"  # Auto-upgrade to latest patch version (e.g., 8.0.35 -> 8.0.36)
+    LATEST_MINOR = "latest_minor"  # Auto-upgrade to latest minor version (e.g., 8.0.x -> 8.2.x)
+    SPECIFIC_VERSION = "specific_version"  # Upgrade to a specific target version
+
+
+class UpgradePolicy(BaseModel):
+    """Version upgrade policy configuration."""
+
+    strategy: UpgradeStrategy = Field(
+        default=UpgradeStrategy.DISABLED, description="Upgrade strategy"
+    )
+    target_version: Optional[str] = Field(
+        default=None, description="Target version (required if strategy is SPECIFIC_VERSION)"
+    )
+    maintenance_window: Optional[str] = Field(
+        default=None,
+        description="Maintenance window for upgrades (cron format, e.g., '0 2 * * 0' for Sundays 2 AM)",
+    )
+    auto_approve: bool = Field(
+        default=False,
+        description="Auto-approve upgrades without manual confirmation",
+    )
+    pre_upgrade_backup: bool = Field(
+        default=True, description="Create backup before upgrading"
+    )
+
+
+class VersionUpgradeRequest(BaseModel):
+    """Request model for upgrading database version."""
+
+    target_version: str = Field(..., description="Target version to upgrade to")
+    skip_backup: bool = Field(
+        default=False, description="Skip pre-upgrade backup (not recommended)"
+    )
+    apply_immediately: bool = Field(
+        default=False,
+        description="Apply upgrade immediately, ignore maintenance window",
+    )
+
+
 class DatabaseCreateRequest(BaseModel):
     """Request model for creating a database."""
 
@@ -64,7 +108,7 @@ class DatabaseCreateRequest(BaseModel):
     )
     engine: DatabaseEngine = Field(..., description="Database engine type")
     version: str = Field(..., description="Database version (e.g., '15.0', '8.0', '6.0')")
-    size: DatabaseSize = Field(default=DatabaseSize.SMALL, description="Instance size")
+    size: DatabaseSize = Field(default=DatabaseSize.MICRO, description="Instance size")
     storage_gb: int = Field(default=20, ge=10, le=10000, description="Storage size in GB")
     replicas: int = Field(default=1, ge=1, le=9, description="Number of replicas")
     backup_enabled: bool = Field(default=True, description="Enable automated backups")
@@ -84,6 +128,9 @@ class DatabaseCreateRequest(BaseModel):
         default=None,
         min_length=8,
         description="Database password (optional, auto-generated if not provided)"
+    )
+    upgrade_policy: Optional[UpgradePolicy] = Field(
+        default=None, description="Automated version upgrade policy"
     )
     labels: Optional[Dict[str, str]] = Field(default=None, description="Custom labels")
     annotations: Optional[Dict[str, str]] = Field(default=None, description="Custom annotations")
@@ -106,6 +153,9 @@ class DatabaseUpdateRequest(BaseModel):
     backup_enabled: Optional[bool] = Field(default=None, description="Enable/disable backups")
     backup_schedule: Optional[BackupSchedule] = Field(default=None, description="Backup schedule")
     monitoring_enabled: Optional[bool] = Field(default=None, description="Enable/disable monitoring")
+    upgrade_policy: Optional[UpgradePolicy] = Field(
+        default=None, description="Update automated version upgrade policy"
+    )
     labels: Optional[Dict[str, str]] = Field(default=None, description="Update labels")
     annotations: Optional[Dict[str, str]] = Field(default=None, description="Update annotations")
 
@@ -154,6 +204,12 @@ class DatabaseResponse(BaseModel):
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
     health_status: Optional[str] = Field(default=None, description="Health status")
+    upgrade_policy: Optional[UpgradePolicy] = Field(
+        default=None, description="Automated version upgrade policy"
+    )
+    available_upgrades: List[str] = Field(
+        default_factory=list, description="List of available upgrade versions"
+    )
     operation_id: Optional[str] = Field(default=None, description="Active operation ID (if any)")
     poll_url: Optional[str] = Field(default=None, description="URL to poll operation status")
 

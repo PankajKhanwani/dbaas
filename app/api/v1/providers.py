@@ -191,21 +191,32 @@ async def get_available_engines(
         engines = {}
         for engine in DatabaseEngine:
             try:
+                logger.info(
+                    "fetching_engine_versions",
+                    engine=engine.value,
+                    provider_id=provider.id,
+                )
                 result = await kubedb_service.get_available_versions(
                     engine=engine,
                     provider_id=provider.id,
-                    kubeconfig_content=provider.kubeconfig_content,
                 )
-                
+
+                logger.info(
+                    "engine_versions_result",
+                    engine=engine.value,
+                    versions_count=len(result.get("versions", [])),
+                )
+
                 # Only include engines that have versions available
                 if result.get("versions"):
                     engines[engine.value] = result.get("versions", [])
-                    
+
             except Exception as e:
-                logger.warning(
+                logger.error(
                     "failed_to_fetch_engine_versions",
                     engine=engine.value,
                     error=str(e),
+                    exc_info=True,
                 )
                 # Continue to next engine instead of failing completely
                 continue

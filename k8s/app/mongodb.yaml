@@ -1,14 +1,4 @@
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: mongodb-auth
-  namespace: kubedb-dbaas
-type: Opaque
-stringData:
-  username: mongodb
-  password: mongodb123!@#
----
 apiVersion: kubedb.com/v1alpha2
 kind: MongoDB
 metadata:
@@ -27,8 +17,6 @@ spec:
       requests:
         storage: 10Gi
   terminationPolicy: WipeOut
-  authSecret:
-    name: mongodb-auth
   podTemplate:
     spec:
       resources:
