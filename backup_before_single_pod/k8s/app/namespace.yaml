@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubedb-dbaas
+  labels:
+    name: kubedb-dbaas
+    app: kubedb-dbaas-platform

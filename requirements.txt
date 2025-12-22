@@ -1,0 +1,47 @@
+# Core dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+email-validator==2.1.0
+
+# Kubernetes clients
+kubernetes==29.0.0
+kubernetes-asyncio==29.0.0
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# Caching & Rate Limiting
+aioredis==2.0.1
+redis==5.0.1
+
+# Database (MongoDB)
+motor==3.3.2
+pymongo==4.6.1
+beanie==1.24.0
+
+# Monitoring & Observability
+prometheus-client==0.19.0
+prometheus-fastapi-instrumentator==6.1.0
+structlog==24.1.0
+opentelemetry-api==1.22.0
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation-fastapi==0.43b0
+opentelemetry-exporter-jaeger==1.21.0
+
+# Secret Management
+hvac==2.1.0
+
+# Utilities
+python-dateutil==2.8.2
+croniter==2.0.1
+tenacity==8.2.3
+httpx==0.26.0
+aiohttp==3.9.1
+aiocache==0.12.2
+slowapi==0.1.9
+sentry-sdk[fastapi]==1.40.0
+pyyaml==6.0.1

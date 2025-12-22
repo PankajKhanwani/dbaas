@@ -1,0 +1,45 @@
+{{- if .Values.redis.enabled }}
+---
+apiVersion: kubedb.com/v1alpha2
+kind: Redis
+metadata:
+  name: {{ .Values.redis.name }}
+  namespace: {{ .Values.namespace.name }}
+spec:
+  version: {{ .Values.redis.version | quote }}
+  mode: {{ .Values.redis.mode }}
+  storage:
+    {{- if .Values.redis.storage.storageClassName }}
+    storageClassName: {{ .Values.redis.storage.storageClassName | quote }}
+    {{- end }}
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: {{ .Values.redis.storage.size }}
+  terminationPolicy: {{ .Values.redis.terminationPolicy }}
+  podTemplate:
+    spec:
+      resources:
+        requests:
+          cpu: {{ .Values.redis.resources.requests.cpu }}
+          memory: {{ .Values.redis.resources.requests.memory }}
+        limits:
+          cpu: {{ .Values.redis.resources.limits.cpu }}
+          memory: {{ .Values.redis.resources.limits.memory }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ .Values.namespace.name }}
+spec:
+  selector:
+    app.kubernetes.io/name: redises.kubedb.com
+    app.kubernetes.io/instance: {{ .Values.redis.name }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+  type: ClusterIP
+{{- end }}

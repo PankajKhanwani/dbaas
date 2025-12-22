@@ -1,0 +1,20 @@
+apiVersion: v2
+name: kubedb-dbaas
+description: Production-grade Database as a Service platform powered by KubeDB
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - kubedb
+  - dbaas
+  - database
+  - postgresql
+  - mysql
+  - mongodb
+  - redis
+home: https://github.com/yourorg/kubedb-dbaas
+sources:
+  - https://github.com/yourorg/kubedb-dbaas
+maintainers:
+  - name: Platform Engineering Team
+    email: platform@yourorg.com

@@ -1,0 +1,138 @@
+replicaCount: 3
+
+image:
+  repository: your-registry/kubedb-dbaas
+  pullPolicy: IfNotPresent
+  tag: "1.0.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+  hosts:
+    - host: dbaas.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: dbaas-tls
+      hosts:
+        - dbaas.example.com
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - kubedb-dbaas
+          topologyKey: kubernetes.io/hostname
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+env:
+  - name: ENVIRONMENT
+    value: "production"
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: MONGODB_URL
+    valueFrom:
+      secretKeyRef:
+        name: kubedb-dbaas-secrets
+        key: mongodb-url
+  - name: REDIS_URL
+    valueFrom:
+      secretKeyRef:
+        name: kubedb-dbaas-secrets
+        key: redis-url
+  - name: SECRET_KEY
+    valueFrom:
+      secretKeyRef:
+        name: kubedb-dbaas-secrets
+        key: secret-key
+
+mongodb:
+  enabled: true
+  auth:
+    enabled: true
+    rootPassword: ""  # Generated if empty
+  architecture: replicaset
+  replicaCount: 3
+  persistence:
+    enabled: true
+    size: 20Gi
+
+redis:
+  enabled: true
+  auth:
+    enabled: true
+    password: ""  # Generated if empty
+  architecture: replicaset
+  master:
+    persistence:
+      enabled: true
+      size: 8Gi
+
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s

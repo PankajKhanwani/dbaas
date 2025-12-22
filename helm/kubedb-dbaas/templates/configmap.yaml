@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.app.name }}-config
+  namespace: {{ .Values.namespace.name }}
+data:
+  ENVIRONMENT: {{ .Values.app.env.environment | quote }}
+  APP_NAME: "KubeDB DBaaS Platform"
+  APP_VERSION: {{ .Chart.AppVersion | quote }}
+  DEBUG: {{ .Values.app.env.debug | quote }}
+  LOG_LEVEL: {{ .Values.app.env.logLevel | quote }}
+  HOST: {{ .Values.app.env.host | quote }}
+  PORT: {{ .Values.app.env.port | quote }}
+  CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
+  CORS_ALLOW_CREDENTIALS: {{ .Values.config.corsAllowCredentials | quote }}
+  CORS_ALLOW_METHODS: {{ .Values.config.corsAllowMethods | quote }}
+  CORS_ALLOW_HEADERS: {{ .Values.config.corsAllowHeaders | quote }}
+  K8S_IN_CLUSTER: {{ .Values.config.k8sInCluster | quote }}
+  PROMETHEUS_ENABLED: {{ .Values.config.prometheusEnabled | quote }}
+  MONGODB_DATABASE: "kubedb_dbaas"
+  MONGODB_MAX_POOL_SIZE: "20"
+  MONGODB_MIN_POOL_SIZE: "2"
+  MONGODB_MAX_IDLE_TIME_MS: "30000"
+  REDIS_MAX_CONNECTIONS: "20"

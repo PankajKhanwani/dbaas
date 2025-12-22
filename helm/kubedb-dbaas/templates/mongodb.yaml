@@ -1,0 +1,47 @@
+{{- if .Values.mongodb.enabled }}
+---
+apiVersion: kubedb.com/v1alpha2
+kind: MongoDB
+metadata:
+  name: {{ .Values.mongodb.name }}
+  namespace: {{ .Values.namespace.name }}
+spec:
+  version: {{ .Values.mongodb.version | quote }}
+  replicas: {{ .Values.mongodb.replicas }}
+  replicaSet:
+    name: {{ .Values.mongodb.replicaSet.name }}
+  storage:
+    {{- if .Values.mongodb.storage.storageClassName }}
+    storageClassName: {{ .Values.mongodb.storage.storageClassName | quote }}
+    {{- end }}
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: {{ .Values.mongodb.storage.size }}
+  terminationPolicy: {{ .Values.mongodb.terminationPolicy }}
+  podTemplate:
+    spec:
+      resources:
+        requests:
+          cpu: {{ .Values.mongodb.resources.requests.cpu }}
+          memory: {{ .Values.mongodb.resources.requests.memory }}
+        limits:
+          cpu: {{ .Values.mongodb.resources.limits.cpu }}
+          memory: {{ .Values.mongodb.resources.limits.memory }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: {{ .Values.namespace.name }}
+spec:
+  selector:
+    app.kubernetes.io/name: mongodbs.kubedb.com
+    app.kubernetes.io/instance: {{ .Values.mongodb.name }}
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: 27017
+  type: ClusterIP
+{{- end }}

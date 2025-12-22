@@ -1,0 +1,124 @@
+[tool.poetry]
+name = "kubedb-dbaas"
+version = "1.0.0"
+description = "Production-grade Database as a Service platform powered by KubeDB"
+authors = ["Your Organization <engineering@yourorg.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/yourorg/kubedb-dbaas"
+repository = "https://github.com/yourorg/kubedb-dbaas"
+keywords = ["kubernetes", "kubedb", "dbaas", "database", "cloud"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+pydantic = "^2.5.3"
+pydantic-settings = "^2.1.0"
+kubernetes = "^29.0.0"
+kubernetes-asyncio = "^29.0.0"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+python-multipart = "^0.0.6"
+aioredis = "^2.0.1"
+redis = "^5.0.1"
+motor = "^3.3.2"
+pymongo = "^4.6.1"
+beanie = "^1.24.0"
+prometheus-client = "^0.19.0"
+prometheus-fastapi-instrumentator = "^6.1.0"
+structlog = "^24.1.0"
+opentelemetry-api = "^1.22.0"
+opentelemetry-sdk = "^1.22.0"
+opentelemetry-instrumentation-fastapi = "^0.43b0"
+opentelemetry-exporter-jaeger = "^1.21.0"
+hvac = "^2.1.0"
+python-dateutil = "^2.8.2"
+croniter = "^2.0.1"
+tenacity = "^8.2.3"
+httpx = "^0.26.0"
+aiocache = "^0.12.2"
+slowapi = "^0.1.9"
+sentry-sdk = {extras = ["fastapi"], version = "^1.40.0"}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.4"
+pytest-asyncio = "^0.23.3"
+pytest-cov = "^4.1.0"
+pytest-mock = "^3.12.0"
+black = "^24.1.1"
+ruff = "^0.1.14"
+mypy = "^1.8.0"
+pre-commit = "^3.6.0"
+httpx = "^0.26.0"
+faker = "^22.1.0"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+include = '\.pyi?$'
+
+[tool.ruff]
+line-length = 100
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--cov=app",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+    "-v"
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

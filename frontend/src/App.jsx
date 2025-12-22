@@ -1,0 +1,1812 @@
+import { useState, useEffect } from 'react'
+import './App.css'
+
+const API_BASE = 'http://localhost:8000/api/v1'
+const DOMAIN = 'demo'
+const PROJECT = 'demo'
+
+function App() {
+  const [databases, setDatabases] = useState([])
+  const [versions, setVersions] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [showCreateModal, setShowCreateModal] = useState(false)
+  const [selectedDb, setSelectedDb] = useState(null)
+  const [showDetailsModal, setShowDetailsModal] = useState(false)
+  const [dbStatus, setDbStatus] = useState(null)
+  const [dbCredentials, setDbCredentials] = useState(null)
+  const [dbMetrics, setDbMetrics] = useState(null)
+  const [metricsLoading, setMetricsLoading] = useState(false)
+  const [activeTab, setActiveTab] = useState('overview')
+  const [notification, setNotification] = useState(null)
+  const [view, setView] = useState('grid')
+  const [metricSearch, setMetricSearch] = useState('')
+  const [collapsedCategories, setCollapsedCategories] = useState({})
+
+  const [newDb, setNewDb] = useState({
+    name: '',
+    region: '',
+    availability_zone: '',
+    engine: '',
+    version: '',
+    size: 'db.t3.micro',
+    storage_gb: 10,
+    replicas: 1,
+    backup_enabled: true,
+    backup_schedule: 'daily',
+    high_availability: false,
+    monitoring_enabled: true,
+    username: '',
+    password: ''
+  })
+  const [availableVersions, setAvailableVersions] = useState([])
+  const [loadingVersions, setLoadingVersions] = useState(false)
+  const [availableEngines, setAvailableEngines] = useState({})
+  const [loadingEngines, setLoadingEngines] = useState(false)
+
+  useEffect(() => {
+    fetchVersions()
+  }, [])
+
+  useEffect(() => {
+    fetchDatabases()
+    const interval = setInterval(fetchDatabases, 5000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const showNotification = (message, type = 'success') => {
+    setNotification({ message, type })
+    setTimeout(() => setNotification(null), 4000)
+  }
+
+  const fetchVersions = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/versions/`)
+      const data = await response.json()
+      setVersions(data)
+
+      // Set first available engine as default
+      const engines = Object.keys(data)
+      if (engines.length > 0) {
+        setNewDb(prev => ({ ...prev, engine: engines[0] }))
+      }
+    } catch (error) {
+      showNotification('Failed to fetch versions', 'error')
+    }
+  }
+
+  const fetchEnginesFromProvider = async (region, availabilityZone) => {
+    if (!region) return
+
+    setLoadingEngines(true)
+    setAvailableEngines({})
+    setAvailableVersions([])
+    setNewDb(prev => ({ ...prev, engine: '', version: '' }))
+
+    try {
+      let url = `${API_BASE}/providers/engines`
+      const params = new URLSearchParams()
+      if (region) params.append('region', region)
+      if (availabilityZone) params.append('availability_zone', availabilityZone)
+
+      if (params.toString()) {
+        url += `?${params.toString()}`
+      }
+
+      const response = await fetch(url)
+      const data = await response.json()
+
+      if (data.error) {
+        showNotification(data.error, 'error')
+        setAvailableEngines({})
+      } else {
+        setAvailableEngines(data.engines || {})
+        // Auto-select first engine if available
+        const engines = Object.keys(data.engines || {})
+        if (engines.length > 0) {
+          const firstEngine = engines[0]
+          const versions = data.engines[firstEngine] || []
+          setNewDb(prev => ({
+            ...prev,
+            engine: firstEngine,
+            version: versions.length > 0 ? versions[0].version : ''
+          }))
+          setAvailableVersions(versions)
+        }
+      }
+    } catch (error) {
+      showNotification('Failed to fetch engines from provider', 'error')
+      setAvailableEngines({})
+    } finally {
+      setLoadingEngines(false)
+    }
+  }
+
+  const fetchVersionsFromProvider = async (engine, region, availabilityZone) => {
+    if (!engine) return
+
+    setLoadingVersions(true)
+    try {
+      let url = `${API_BASE}/providers/versions/${engine}`
+      const params = new URLSearchParams()
+      if (region) params.append('region', region)
+      if (availabilityZone) params.append('availability_zone', availabilityZone)
+
+      if (params.toString()) {
+        url += `?${params.toString()}`
+      }
+
+      const response = await fetch(url)
+      const data = await response.json()
+
+      if (data.error) {
+        showNotification(data.error, 'error')
+        setAvailableVersions([])
+      } else {
+        setAvailableVersions(data.versions || [])
+        // Auto-select first version if available
+        if (data.versions && data.versions.length > 0) {
+          setNewDb(prev => ({ ...prev, version: data.versions[0].version }))
+        }
+      }
+    } catch (error) {
+      showNotification('Failed to fetch versions from provider', 'error')
+      setAvailableVersions([])
+    } finally {
+      setLoadingVersions(false)
+    }
+  }
+
+  const fetchDatabases = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/`)
+      const data = await response.json()
+      setDatabases(data.databases || [])
+      setLoading(false)
+    } catch (error) {
+      setLoading(false)
+    }
+  }
+
+  const fetchDbDetails = async (id) => {
+    try {
+      const [statusRes, credsRes] = await Promise.all([
+        fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/status`),
+        fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/credentials`)
+      ])
+      const status = await statusRes.json()
+      const creds = credsRes.ok ? await credsRes.json() : null
+      setDbStatus(status)
+      setDbCredentials(creds)
+    } catch (error) {
+      console.error('Failed to fetch details:', error)
+    }
+  }
+
+  const fetchDbMetrics = async (id) => {
+    setMetricsLoading(true)
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/metrics`)
+      if (response.ok) {
+        const metrics = await response.json()
+        setDbMetrics(metrics)
+      } else {
+        setDbMetrics(null)
+        showNotification('Failed to fetch metrics. Make sure monitoring is enabled.', 'error')
+      }
+    } catch (error) {
+      console.error('Failed to fetch metrics:', error)
+      setDbMetrics(null)
+      showNotification('Error fetching metrics', 'error')
+    } finally {
+      setMetricsLoading(false)
+    }
+  }
+
+  const openDetails = async (db) => {
+    setSelectedDb(db)
+    setShowDetailsModal(true)
+    setActiveTab('overview')
+    setDbMetrics(null)
+    await fetchDbDetails(db.id)
+  }
+
+  const createDatabase = async (e) => {
+    e.preventDefault()
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newDb)
+      })
+      if (response.ok) {
+        showNotification('Database created successfully!')
+        setShowCreateModal(false)
+        setNewDb({
+          name: '', engine: 'mongodb', version: '', size: 'db.t3.micro',
+          storage_gb: 10, replicas: 1, backup_enabled: true, backup_schedule: 'daily',
+          high_availability: false, monitoring_enabled: true
+        })
+        fetchDatabases()
+      } else {
+        const error = await response.json()
+        showNotification(error.detail || 'Failed to create database', 'error')
+      }
+    } catch (error) {
+      showNotification('Failed to create database', 'error')
+    }
+  }
+
+  const deleteDatabase = async (id, name) => {
+    if (!confirm(`Delete database "${name}"? This cannot be undone.`)) return
+    try {
+      await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}`, {
+        method: 'DELETE'
+      })
+      showNotification('Database deleted successfully!')
+      setShowDetailsModal(false)
+      fetchDatabases()
+    } catch (error) {
+      showNotification('Failed to delete database', 'error')
+    }
+  }
+
+  const scaleDatabase = async (id, newReplicas) => {
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/scale`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ replicas: newReplicas })
+      })
+      if (response.ok) {
+        showNotification('Scaling initiated!')
+        fetchDatabases()
+      }
+    } catch (error) {
+      showNotification('Failed to scale database', 'error')
+    }
+  }
+
+  const updateDatabaseConfig = async (id, updates) => {
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+      })
+      if (response.ok) {
+        showNotification('Database configuration updated!')
+        fetchDatabases()
+        setShowDetailsModal(false)
+      } else {
+        const error = await response.json()
+        showNotification(error.detail || 'Failed to update database', 'error')
+      }
+    } catch (error) {
+      showNotification('Failed to update database', 'error')
+    }
+  }
+
+  const pauseDatabase = async (id) => {
+    try {
+      await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/pause`, {
+        method: 'POST'
+      })
+      showNotification('Database paused!')
+      fetchDatabases()
+    } catch (error) {
+      showNotification('Failed to pause database', 'error')
+    }
+  }
+
+  const resumeDatabase = async (id) => {
+    try {
+      await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/resume`, {
+        method: 'POST'
+      })
+      showNotification('Database resumed!')
+      fetchDatabases()
+    } catch (error) {
+      showNotification('Failed to resume database', 'error')
+    }
+  }
+
+  const getStatusColor = (status) => {
+    const colors = {
+      pending: '#f59e0b', provisioning: '#3b82f6', running: '#10b981',
+      failed: '#ef4444', scaling: '#8b5cf6', paused: '#6b7280'
+    }
+    return colors[status] || '#9ca3af'
+  }
+
+  const getStatusIcon = (status) => {
+    const icons = {
+      pending: '⏳', provisioning: '🔄', running: '✅',
+      failed: '❌', scaling: '📈', paused: '⏸️'
+    }
+    return icons[status] || '•'
+  }
+
+  const getEngineIcon = (engine) => {
+    const icons = {
+      mongodb: '🍃',
+      postgres: '🐘',
+      mysql: '🐬',
+      mariadb: '🦭',
+      redis: '🔴',
+      elasticsearch: '🔍'
+    }
+    return icons[engine] || '🗄️'
+  }
+
+  const getDefaultUsername = (engine) => {
+    const defaults = {
+      mariadb: 'root',
+      elasticsearch: 'elastic'
+    }
+    return defaults[engine] || ''
+  }
+
+  const isUsernameFixed = (engine) => {
+    return engine === 'mariadb' || engine === 'elasticsearch'
+  }
+
+  return (
+    <div className="app">
+      {/* Sidebar */}
+      <div className="sidebar">
+        <div className="sidebar-header">
+          <div className="logo-container">
+            <div className="logo">⚡</div>
+            <div>
+              <h1>KubeDB Platform</h1>
+              <p className="sidebar-subtitle">Enterprise DBaaS</p>
+            </div>
+          </div>
+        </div>
+        <nav className="sidebar-nav">
+          <button className="nav-item active">
+            <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>
+            </svg>
+            <span>Databases</span>
+            <span className="nav-badge">{databases.length}</span>
+          </button>
+          <button className="nav-item disabled">
+            <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+            </svg>
+            <span>Monitoring</span>
+          </button>
+          <button className="nav-item disabled">
+            <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+            </svg>
+            <span>Backups</span>
+          </button>
+          <button className="nav-item disabled">
+            <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
+            </svg>
+            <span>Settings</span>
+          </button>
+        </nav>
+        <div className="sidebar-footer">
+          <div className="stats-box-enhanced">
+            <div className="stat-item-enhanced">
+              <div className="stat-icon-circle blue">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                </svg>
+              </div>
+              <div>
+                <span className="stat-label">Total Databases</span>
+                <span className="stat-value-enhanced">{databases.length}</span>
+              </div>
+            </div>
+            <div className="stat-item-enhanced">
+              <div className="stat-icon-circle green">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                </svg>
+              </div>
+              <div>
+                <span className="stat-label">Active Now</span>
+                <span className="stat-value-enhanced running">{databases.filter(d => d.status === 'running').length}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="main-content">
+        <header className="top-bar">
+          <div>
+            <h2>Database Instances</h2>
+            <p className="subtitle">Manage your database deployments</p>
+          </div>
+          <div className="top-bar-actions">
+            <div className="view-toggle">
+              <button
+                className={view === 'grid' ? 'active' : ''}
+                onClick={() => setView('grid')}
+              >
+                ▦ Grid
+              </button>
+              <button
+                className={view === 'list' ? 'active' : ''}
+                onClick={() => setView('list')}
+              >
+                ☰ List
+              </button>
+            </div>
+            <button className="btn-primary" onClick={() => setShowCreateModal(true)}>
+              + New Database
+            </button>
+          </div>
+        </header>
+
+        {/* Notification Toast */}
+        {notification && (
+          <div className={`notification notification-${notification.type}`}>
+            {notification.message}
+          </div>
+        )}
+
+        {/* Database Grid/List */}
+        {loading ? (
+          <div className="loading">
+            <div className="spinner"></div>
+            <p>Loading databases...</p>
+          </div>
+        ) : databases.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon">🗄️</div>
+            <h3>No databases yet</h3>
+            <p>Create your first database to get started</p>
+            <button className="btn-primary" onClick={() => setShowCreateModal(true)}>
+              + Create Database
+            </button>
+          </div>
+        ) : (
+          <div className={`db-${view}`}>
+            {databases.map(db => (
+              <div key={db.id} className="db-card" onClick={() => openDetails(db)}>
+                <div className="db-card-header">
+                  <div>
+                    <h3>
+                      <span className="engine-icon">{getEngineIcon(db.engine)}</span>
+                      {db.name}
+                    </h3>
+                    <p className="db-meta">
+                      {db.engine}
+                      {db.engine === 'redis' && db.version && db.version.includes('valkey') && (
+                        <span style={{color: '#8b5cf6', fontWeight: 600}}> (Valkey)</span>
+                      )}
+                      {' '}{db.version}
+                    </p>
+                  </div>
+                  <span
+                    className="status-badge"
+                    style={{ backgroundColor: getStatusColor(db.status) }}
+                  >
+                    {getStatusIcon(db.status)} {db.status}
+                  </span>
+                </div>
+                <div className="db-card-body">
+                  <div className="info-grid">
+                    <div className="info-item">
+                      <span className="info-label">Replicas</span>
+                      <span className="info-value">
+                        {db.ready_replicas}/{db.replicas}
+                        {db.ready_replicas < db.replicas && ' ⚠️'}
+                      </span>
+                    </div>
+                    <div className="info-item">
+                      <span className="info-label">Storage</span>
+                      <span className="info-value">{db.storage_gb} GB</span>
+                    </div>
+                    <div className="info-item">
+                      <span className="info-label">Backup</span>
+                      <span className="info-value">{db.backup_enabled ? '✅' : '❌'}</span>
+                    </div>
+                    <div className="info-item">
+                      <span className="info-label">HA</span>
+                      <span className="info-value">{db.high_availability ? '✅' : '❌'}</span>
+                    </div>
+                  </div>
+                  {db.endpoint && (
+                    <div className="endpoint-box">
+                      <code>{db.endpoint}:{db.port}</code>
+                    </div>
+                  )}
+                </div>
+                <div className="db-card-footer">
+                  <span className="timestamp">Created {new Date(db.created_at).toLocaleDateString()}</span>
+                  <div className="card-actions">
+                    <button
+                      className="btn-icon btn-icon-danger"
+                      onClick={(e) => { e.stopPropagation(); deleteDatabase(db.id, db.name); }}
+                      title="Delete database"
+                    >
+                      🗑️
+                    </button>
+                    <button
+                      className="btn-icon"
+                      onClick={(e) => { e.stopPropagation(); openDetails(db); }}
+                    >
+                      View Details →
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Create Database Modal - Improved */}
+      {showCreateModal && (
+        <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
+          <div className="modal modal-create" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h2>🚀 Create Database</h2>
+                <p className="modal-subtitle">Deploy a new managed database instance</p>
+              </div>
+              <button className="modal-close" onClick={() => setShowCreateModal(false)}>×</button>
+            </div>
+            <form onSubmit={createDatabase}>
+              <div className="modal-body">
+                {/* Quick Start Section */}
+                <div className="create-section highlighted">
+                  <div className="section-icon">⚙️</div>
+                  <div className="section-content">
+                    <h3>Essential Configuration</h3>
+                    <div className="form-row-vertical">
+                      <div className="form-group-inline">
+                        <label>Database Name <span className="required">*</span></label>
+                        <input
+                          type="text"
+                          value={newDb.name}
+                          onChange={(e) => setNewDb({ ...newDb, name: e.target.value })}
+                          placeholder="e.g. my-app-db"
+                          className="input-large"
+                          required
+                        />
+                      </div>
+
+                      {/* Database Credentials */}
+                      <div className="form-row">
+                        <div className="form-group-inline">
+                          <label>
+                            Username{' '}
+                            {isUsernameFixed(newDb.engine) ? (
+                              <span className="required">(fixed - cannot be changed)</span>
+                            ) : (
+                              <span className="optional">(optional - auto-generated if empty)</span>
+                            )}
+                          </label>
+                          <input
+                            type="text"
+                            value={isUsernameFixed(newDb.engine) ? getDefaultUsername(newDb.engine) : newDb.username}
+                            onChange={(e) => setNewDb({ ...newDb, username: e.target.value })}
+                            placeholder={isUsernameFixed(newDb.engine)
+                              ? getDefaultUsername(newDb.engine)
+                              : "Enter custom username or leave empty"}
+                            className="input-large"
+                            disabled={isUsernameFixed(newDb.engine)}
+                            style={isUsernameFixed(newDb.engine) ? {backgroundColor: '#f5f5f5', cursor: 'not-allowed'} : {}}
+                          />
+                        </div>
+
+                        <div className="form-group-inline">
+                          <label>Password <span className="optional">(optional - auto-generated if empty)</span></label>
+                          <input
+                            type="password"
+                            value={newDb.password}
+                            onChange={(e) => setNewDb({ ...newDb, password: e.target.value })}
+                            placeholder="Enter custom password or leave empty"
+                            className="input-large"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group-inline">
+                          <label>Region <span className="required">*</span></label>
+                          <input
+                            type="text"
+                            value={newDb.region}
+                            onChange={(e) => {
+                              const region = e.target.value
+                              setNewDb({ ...newDb, region, engine: '', version: '' })
+                              setAvailableVersions([])
+                              setAvailableEngines({})
+                              // Fetch engines when region changes
+                              if (region) {
+                                fetchEnginesFromProvider(region, newDb.availability_zone)
+                              }
+                            }}
+                            placeholder="e.g., us-east-1"
+                            className="input-large"
+                            required
+                          />
+                          <small>Cloud region where database will be deployed</small>
+                        </div>
+
+                        <div className="form-group-inline">
+                          <label>Availability Zone <span className="optional">(optional)</span></label>
+                          <input
+                            type="text"
+                            value={newDb.availability_zone}
+                            onChange={(e) => {
+                              const az = e.target.value
+                              setNewDb({ ...newDb, availability_zone: az, engine: '', version: '' })
+                              setAvailableVersions([])
+                              setAvailableEngines({})
+                              // Fetch engines when AZ changes
+                              if (newDb.region) {
+                                fetchEnginesFromProvider(newDb.region, az)
+                              }
+                            }}
+                            placeholder="e.g., us-east-1a"
+                            className="input-large"
+                          />
+                          <small>Specific AZ for deployment (optional)</small>
+                        </div>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group-inline">
+                          <label>Engine <span className="required">*</span></label>
+                          <select
+                            value={newDb.engine}
+                            onChange={(e) => {
+                              const engine = e.target.value
+                              // Get versions for selected engine from availableEngines
+                              const versions = availableEngines[engine] || []
+                              setAvailableVersions(versions)
+                              setNewDb({
+                                ...newDb,
+                                engine,
+                                version: versions.length > 0 ? versions[0].version : ''
+                              })
+                            }}
+                            className="select-large"
+                            required
+                            disabled={!newDb.region || loadingEngines}
+                          >
+                            <option value="">
+                              {loadingEngines
+                                ? 'Loading engines...'
+                                : !newDb.region
+                                ? 'Select region first'
+                                : Object.keys(availableEngines).length === 0
+                                ? 'No engines available'
+                                : 'Select database engine'}
+                            </option>
+                            {Object.keys(availableEngines).map(engine => (
+                              <option key={engine} value={engine}>
+                                {engine === 'mongodb' && '🍃 MongoDB'}
+                                {engine === 'postgres' && '🐘 PostgreSQL'}
+                                {engine === 'mysql' && '🐬 MySQL'}
+                                {engine === 'mariadb' && '🦭 MariaDB'}
+                                {engine === 'redis' && '🔴 Redis / Valkey'}
+                                {engine === 'elasticsearch' && '🔍 Elasticsearch'}
+                              </option>
+                            ))}
+                          </select>
+                          {!newDb.region && <small style={{color: '#ef4444'}}>Please select a region first</small>}
+                          {loadingEngines && <small style={{color: '#64748b'}}>Fetching engines from cluster...</small>}
+                          {!loadingEngines && newDb.region && Object.keys(availableEngines).length === 0 && (
+                            <small style={{color: '#ef4444'}}>No engines found for this region</small>
+                          )}
+                        </div>
+
+                        <div className="form-group-inline">
+                          <label>
+                            Version <span className="required">*</span>
+                            {newDb.engine === 'redis' && (
+                              <span className="version-note"> (includes Valkey)</span>
+                            )}
+                          </label>
+                          <select
+                            value={newDb.version}
+                            onChange={(e) => setNewDb({ ...newDb, version: e.target.value })}
+                            className="select-large"
+                            disabled={!newDb.engine || loadingEngines || loadingVersions}
+                            required
+                          >
+                            <option value="">
+                              {loadingEngines || loadingVersions
+                                ? 'Loading versions...'
+                                : !newDb.engine
+                                ? 'Select engine first'
+                                : availableVersions.length === 0
+                                ? 'No versions available'
+                                : 'Choose version...'}
+                            </option>
+                            {availableVersions.map(v => {
+                              const isValkey = v.name && v.name.includes('valkey')
+                              const displayName = isValkey
+                                ? `${v.version} - Valkey (${v.name})`
+                                : v.version + (v.name && v.name !== v.version ? ` (${v.name})` : '')
+                              return (
+                                <option key={v.name || v.version} value={v.name || v.version}>
+                                  {isValkey && '🟣 '}{displayName}
+                                </option>
+                              )
+                            })}
+                          </select>
+                          {(loadingEngines || loadingVersions) && <small style={{color: '#64748b'}}>Fetching versions from cluster...</small>}
+                          {!loadingEngines && !loadingVersions && newDb.engine && availableVersions.length === 0 && (
+                            <small style={{color: '#ef4444'}}>No versions found for this engine</small>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Capacity Section */}
+                <div className="create-section">
+                  <div className="section-icon">💪</div>
+                  <div className="section-content">
+                    <h3>Capacity & Performance</h3>
+                    <div className="capacity-selector">
+                      <div className="capacity-option">
+                        <label>Instance Size</label>
+                        <select
+                          value={newDb.size}
+                          onChange={(e) => setNewDb({ ...newDb, size: e.target.value })}
+                          className="select-large"
+                        >
+                          <option value="db.t3.micro">💻 Micro - 1 CPU, 1GB RAM</option>
+                          <option value="db.t3.small">📊 Small - 1 CPU, 2GB RAM</option>
+                          <option value="db.t3.medium">🚀 Medium - 2 CPU, 4GB RAM</option>
+                          <option value="db.t3.large">⚡ Large - 2 CPU, 8GB RAM</option>
+                        </select>
+                      </div>
+
+                      <div className="capacity-sliders">
+                        <div className="slider-group">
+                          <label>
+                            <span>Replicas</span>
+                            <span className="value-badge">{newDb.replicas}</span>
+                          </label>
+                          <input
+                            type="range"
+                            min="1"
+                            max="5"
+                            value={newDb.replicas}
+                            onChange={(e) => setNewDb({ ...newDb, replicas: parseInt(e.target.value) })}
+                            className="slider"
+                          />
+                          <div className="slider-labels">
+                            <span>1</span>
+                            <span>5</span>
+                          </div>
+                        </div>
+
+                        <div className="slider-group">
+                          <label>
+                            <span>Storage</span>
+                            <span className="value-badge">{newDb.storage_gb} GB</span>
+                          </label>
+                          <input
+                            type="range"
+                            min="10"
+                            max="100"
+                            step="10"
+                            value={newDb.storage_gb}
+                            onChange={(e) => setNewDb({ ...newDb, storage_gb: parseInt(e.target.value) })}
+                            className="slider"
+                          />
+                          <div className="slider-labels">
+                            <span>10 GB</span>
+                            <span>100 GB</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Features Section */}
+                <div className="create-section">
+                  <div className="section-icon">✨</div>
+                  <div className="section-content">
+                    <h3>Features</h3>
+                    <div className="feature-toggles">
+                      <div className={`feature-card ${newDb.backup_enabled ? 'active' : ''}`}>
+                        <label className="feature-toggle">
+                          <input
+                            type="checkbox"
+                            checked={newDb.backup_enabled}
+                            onChange={(e) => setNewDb({ ...newDb, backup_enabled: e.target.checked })}
+                          />
+                          <div className="toggle-content">
+                            <div className="toggle-header">
+                              <span className="toggle-icon">💾</span>
+                              <span className="toggle-title">Automated Backups</span>
+                            </div>
+                            <span className="toggle-desc">Daily snapshots with point-in-time recovery</span>
+                          </div>
+                        </label>
+                        {newDb.backup_enabled && (
+                          <select
+                            value={newDb.backup_schedule}
+                            onChange={(e) => setNewDb({ ...newDb, backup_schedule: e.target.value })}
+                            className="feature-option"
+                          >
+                            <option value="hourly">⏱️ Every Hour</option>
+                            <option value="daily">📅 Daily</option>
+                            <option value="weekly">📆 Weekly</option>
+                          </select>
+                        )}
+                      </div>
+
+                      <div className={`feature-card ${newDb.high_availability ? 'active' : ''}`}>
+                        <label className="feature-toggle">
+                          <input
+                            type="checkbox"
+                            checked={newDb.high_availability}
+                            onChange={(e) => setNewDb({ ...newDb, high_availability: e.target.checked })}
+                          />
+                          <div className="toggle-content">
+                            <div className="toggle-header">
+                              <span className="toggle-icon">🌐</span>
+                              <span className="toggle-title">High Availability</span>
+                            </div>
+                            <span className="toggle-desc">Multi-AZ deployment for 99.99% uptime</span>
+                          </div>
+                        </label>
+                      </div>
+
+                      <div className={`feature-card ${newDb.monitoring_enabled ? 'active' : ''}`}>
+                        <label className="feature-toggle">
+                          <input
+                            type="checkbox"
+                            checked={newDb.monitoring_enabled}
+                            onChange={(e) => setNewDb({ ...newDb, monitoring_enabled: e.target.checked })}
+                          />
+                          <div className="toggle-content">
+                            <div className="toggle-header">
+                              <span className="toggle-icon">📊</span>
+                              <span className="toggle-title">Monitoring</span>
+                            </div>
+                            <span className="toggle-desc">Real-time metrics and alerting</span>
+                          </div>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="modal-footer">
+                <button type="button" className="btn-secondary" onClick={() => setShowCreateModal(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary btn-large">
+                  🚀 Create Database
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Database Details Modal */}
+      {showDetailsModal && selectedDb && (
+        <div className="modal-overlay" onClick={() => setShowDetailsModal(false)}>
+          <div className="modal modal-large" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h2>
+                  <span className="engine-icon">{getEngineIcon(selectedDb.engine)}</span>
+                  {selectedDb.name}
+                </h2>
+                <p className="modal-subtitle">
+                  {selectedDb.engine}
+                  {selectedDb.engine === 'redis' && selectedDb.version && selectedDb.version.includes('valkey') && (
+                    <span style={{color: '#8b5cf6', fontWeight: 600}}> (Valkey)</span>
+                  )}
+                  {' '}{selectedDb.version}
+                </p>
+              </div>
+              <button className="modal-close" onClick={() => setShowDetailsModal(false)}>×</button>
+            </div>
+
+            <div className="tabs">
+              <button
+                className={activeTab === 'overview' ? 'tab active' : 'tab'}
+                onClick={() => setActiveTab('overview')}
+              >
+                Overview
+              </button>
+              <button
+                className={activeTab === 'status' ? 'tab active' : 'tab'}
+                onClick={() => setActiveTab('status')}
+              >
+                Status
+              </button>
+              <button
+                className={activeTab === 'credentials' ? 'tab active' : 'tab'}
+                onClick={() => setActiveTab('credentials')}
+              >
+                Credentials
+              </button>
+              <button
+                className={activeTab === 'monitoring' ? 'tab active' : 'tab'}
+                onClick={() => setActiveTab('monitoring')}
+              >
+                Monitoring
+              </button>
+              <button
+                className={activeTab === 'actions' ? 'tab active' : 'tab'}
+                onClick={() => setActiveTab('actions')}
+              >
+                Actions
+              </button>
+            </div>
+
+            <div className="modal-body">
+              {activeTab === 'overview' && (
+                <div className="tab-content">
+                  <div className="detail-grid">
+                    <div className="detail-card">
+                      <h4>Configuration</h4>
+                      <dl>
+                        <dt>Engine</dt>
+                        <dd>
+                          {selectedDb.engine}
+                          {selectedDb.engine === 'redis' && selectedDb.version && selectedDb.version.includes('valkey') && (
+                            <span style={{marginLeft: '0.5rem', color: '#8b5cf6', fontSize: '0.85rem'}}>
+                              (Valkey)
+                            </span>
+                          )}
+                        </dd>
+                        <dt>Version</dt><dd>{selectedDb.version}</dd>
+                        <dt>Size</dt><dd>{selectedDb.size}</dd>
+                        <dt>Storage</dt><dd>{selectedDb.storage_gb} GB</dd>
+                      </dl>
+                    </div>
+                    <div className="detail-card">
+                      <h4>Replication</h4>
+                      <dl>
+                        <dt>Replicas</dt>
+                        <dd className="replica-status">
+                          <span className={selectedDb.ready_replicas === selectedDb.replicas ? 'healthy' : 'warning'}>
+                            {selectedDb.ready_replicas}/{selectedDb.replicas}
+                          </span>
+                        </dd>
+                        <dt>High Availability</dt>
+                        <dd>{selectedDb.high_availability ? 'Enabled ✅' : 'Disabled'}</dd>
+                      </dl>
+                    </div>
+                    <div className="detail-card">
+                      <h4>Features</h4>
+                      <dl>
+                        <dt>Backups</dt>
+                        <dd>{selectedDb.backup_enabled ? `Enabled (${selectedDb.backup_schedule})` : 'Disabled'}</dd>
+                        <dt>Monitoring</dt>
+                        <dd>{selectedDb.monitoring_enabled ? 'Enabled ✅' : 'Disabled'}</dd>
+                      </dl>
+                    </div>
+                    <div className="detail-card">
+                      <h4>Connection</h4>
+                      <dl>
+                        <dt>Endpoint</dt>
+                        <dd><code>{selectedDb.endpoint || 'Not ready'}</code></dd>
+                        <dt>Port</dt>
+                        <dd>{selectedDb.port || 'N/A'}</dd>
+                      </dl>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'status' && dbStatus && (
+                <div className="tab-content">
+                  <div className="status-overview">
+                    <div className="status-item">
+                      <span className="status-label">Status Phase</span>
+                      <span className="status-value">{dbStatus.kubedb_phase || 'Unknown'}</span>
+                    </div>
+                    <div className="status-item">
+                      <span className="status-label">Ready</span>
+                      <span className="status-value">{dbStatus.is_ready ? '✅ Yes' : '❌ No'}</span>
+                    </div>
+                    <div className="status-item">
+                      <span className="status-label">Replicas</span>
+                      <span className="status-value">
+                        {dbStatus.replicas?.ready || 0}/{dbStatus.replicas?.desired || 0}
+                      </span>
+                    </div>
+                  </div>
+                  {dbStatus.message && (
+                    <div className="status-message">
+                      <strong>Message:</strong> {dbStatus.message}
+                    </div>
+                  )}
+                  {dbStatus.events && dbStatus.events.length > 0 && (
+                    <div className="events-section">
+                      <h4>⚠️ Recent Events</h4>
+                      <div className="events-list">
+                        {dbStatus.events.map((event, i) => (
+                          <div key={i} className={`event-item event-${event.type.toLowerCase()}`}>
+                            <div className="event-header">
+                              <span className="event-reason">{event.reason}</span>
+                              <span className="event-count">×{event.count}</span>
+                            </div>
+                            <p className="event-message">{event.message}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {dbStatus.conditions && dbStatus.conditions.length > 0 && (
+                    <div className="conditions">
+                      <h4>Conditions</h4>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Message</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {dbStatus.conditions.map((c, i) => (
+                            <tr key={i}>
+                              <td>{c.type}</td>
+                              <td>{c.status}</td>
+                              <td>{c.message}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {activeTab === 'credentials' && (
+                <div className="tab-content">
+                  {dbCredentials ? (
+                    <div className="credentials-box">
+                      <div className="cred-item">
+                        <label>Username</label>
+                        <code>{dbCredentials.username}</code>
+                      </div>
+                      <div className="cred-item">
+                        <label>Password</label>
+                        <code>{dbCredentials.password}</code>
+                      </div>
+                      <div className="cred-item">
+                        <label>Host</label>
+                        <code>{dbCredentials.host}</code>
+                      </div>
+                      <div className="cred-item">
+                        <label>Port</label>
+                        <code>{dbCredentials.port}</code>
+                      </div>
+                      <div className="cred-item full-width">
+                        <label>Connection String</label>
+                        <code className="connection-string">{dbCredentials.connection_string}</code>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="empty-message">
+                      Credentials not available yet. Wait for database to be ready.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {activeTab === 'monitoring' && (
+                <div className="tab-content">
+                  <div className="monitoring-section">
+                    <div className="monitoring-status-card">
+                      <div className="monitoring-status-header">
+                        <h4>📊 Monitoring Status</h4>
+                        <span className={`status-badge ${selectedDb.monitoring_enabled ? 'status-enabled' : 'status-disabled'}`}>
+                          {selectedDb.monitoring_enabled ? 'Enabled ✅' : 'Disabled ❌'}
+                        </span>
+                      </div>
+
+                      {selectedDb.monitoring_enabled ? (
+                        <div className="monitoring-info">
+                          <div className="monitoring-header-actions">
+                            <p className="monitoring-description">
+                              Monitoring is active for this database. Real-time metrics via Kubernetes service endpoints (no port-forward required).
+                            </p>
+                            <button
+                              className="btn-secondary"
+                              onClick={() => fetchDbMetrics(selectedDb.id)}
+                              disabled={metricsLoading}
+                            >
+                              {metricsLoading ? 'Loading...' : dbMetrics ? 'Refresh Metrics' : 'Load Metrics'}
+                            </button>
+                          </div>
+
+                          {dbMetrics && !metricsLoading && (
+                            <div className="metrics-display">
+                              {dbMetrics.available === false ? (
+                                <div className="monitoring-unavailable">
+                                  <p>Metrics are currently unavailable. The monitoring service may be starting up.</p>
+                                  <p className="monitoring-note">Database: {dbMetrics.database}</p>
+                                </div>
+                              ) : (
+                                <>
+                                  <h5>📊 Current Metrics</h5>
+
+                                  {/* Active Connections */}
+                                  {dbMetrics.connections && (
+                                    <div className="metrics-section">
+                                      <h6>🔗 Active Connections</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.connections.active !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">👥</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Active</span>
+                                              <span className="metric-value">{dbMetrics.connections.active}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.connections.available !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">✅</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Available</span>
+                                              <span className="metric-value">{dbMetrics.connections.available}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.connections.total !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🎯</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Total</span>
+                                              <span className="metric-value">{dbMetrics.connections.total}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.connections.used_percent !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📊</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Usage</span>
+                                              <span className="metric-value">{dbMetrics.connections.used_percent.toFixed(1)}%</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Read/Write Operations */}
+                                  {dbMetrics.operations && (
+                                    <div className="metrics-section">
+                                      <h6>📊 Database Operations (Read/Write)</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.operations.reads !== undefined && (
+                                          <div className="metric-value-card highlight-read">
+                                            <span className="metric-icon">📖</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Total Reads</span>
+                                              <span className="metric-value">{dbMetrics.operations.reads.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.operations.writes !== undefined && (
+                                          <div className="metric-value-card highlight-write">
+                                            <span className="metric-icon">✍️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Total Writes</span>
+                                              <span className="metric-value">{dbMetrics.operations.writes.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.operations.inserts !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">➕</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Inserts</span>
+                                              <span className="metric-value">{dbMetrics.operations.inserts.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.operations.updates !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">✏️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Updates</span>
+                                              <span className="metric-value">{dbMetrics.operations.updates.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.operations.deletes !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🗑️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Deletes</span>
+                                              <span className="metric-value">{dbMetrics.operations.deletes.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.operations.commands !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⚙️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Commands</span>
+                                              <span className="metric-value">{dbMetrics.operations.commands.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Load Metrics */}
+                                  {dbMetrics.load && Object.keys(dbMetrics.load).length > 0 && (
+                                    <div className="metrics-section">
+                                      <h6>⚡ System Load</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.load.memory_resident_mb !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🧠</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Memory (Resident)</span>
+                                              <span className="metric-value">{dbMetrics.load.memory_resident_mb.toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.load.memory_virtual_mb !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📦</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Memory (Virtual)</span>
+                                              <span className="metric-value">{dbMetrics.load.memory_virtual_mb.toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.load.cpu_total_ms !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⚙️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">CPU Time</span>
+                                              <span className="metric-value">{(dbMetrics.load.cpu_total_ms / 1000).toFixed(2)} sec</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.load.network_requests !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📡</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Network Requests</span>
+                                              <span className="metric-value">{dbMetrics.load.network_requests.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.load.network_in_bytes !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⬇️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Network In</span>
+                                              <span className="metric-value">{(dbMetrics.load.network_in_bytes / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.load.network_out_bytes !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⬆️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Network Out</span>
+                                              <span className="metric-value">{(dbMetrics.load.network_out_bytes / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Storage Section */}
+                                  {dbMetrics.storage && Object.keys(dbMetrics.storage).length > 0 && (
+                                    <div className="metrics-section">
+                                      <h6>💾 Storage</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.storage.total_data_size !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📁</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Data Size</span>
+                                              <span className="metric-value">{(dbMetrics.storage.total_data_size / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.storage.total_storage_size !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">💿</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Storage Size</span>
+                                              <span className="metric-value">{(dbMetrics.storage.total_storage_size / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.storage.total_collections !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📚</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Collections</span>
+                                              <span className="metric-value">{dbMetrics.storage.total_collections}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.storage.total_indexes !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🔍</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Indexes</span>
+                                              <span className="metric-value">{dbMetrics.storage.total_indexes}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Network Section (MongoDB) */}
+                                  {dbMetrics.network && (
+                                    <div className="metrics-section">
+                                      <h6>🌐 Network</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.network.bytes_in !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⬇️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Bytes In</span>
+                                              <span className="metric-value">{(dbMetrics.network.bytes_in / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.network.bytes_out !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⬆️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Bytes Out</span>
+                                              <span className="metric-value">{(dbMetrics.network.bytes_out / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.network.requests !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📡</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Requests</span>
+                                              <span className="metric-value">{dbMetrics.network.requests.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.network.bytes_received !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⬇️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Received</span>
+                                              <span className="metric-value">{(dbMetrics.network.bytes_received / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.network.bytes_sent !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⬆️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Sent</span>
+                                              <span className="metric-value">{(dbMetrics.network.bytes_sent / (1024**2)).toFixed(2)} MB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Transactions Section (PostgreSQL) */}
+                                  {dbMetrics.transactions && (
+                                    <div className="metrics-section">
+                                      <h6>💼 Transactions</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.transactions.commits !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">✅</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Commits</span>
+                                              <span className="metric-value">{dbMetrics.transactions.commits.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.transactions.rollbacks !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">↩️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Rollbacks</span>
+                                              <span className="metric-value">{dbMetrics.transactions.rollbacks.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Activity Section (PostgreSQL) */}
+                                  {dbMetrics.activity && (
+                                    <div className="metrics-section">
+                                      <h6>📈 Activity</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.activity.rows_inserted !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">➕</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Rows Inserted</span>
+                                              <span className="metric-value">{dbMetrics.activity.rows_inserted.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.activity.rows_updated !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">✏️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Rows Updated</span>
+                                              <span className="metric-value">{dbMetrics.activity.rows_updated.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.activity.rows_deleted !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🗑️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Rows Deleted</span>
+                                              <span className="metric-value">{dbMetrics.activity.rows_deleted.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.activity.rows_fetched !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📥</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Rows Fetched</span>
+                                              <span className="metric-value">{dbMetrics.activity.rows_fetched.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Cache Section (PostgreSQL) */}
+                                  {dbMetrics.cache && (
+                                    <div className="metrics-section">
+                                      <h6>⚡ Cache</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.cache.hits !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🎯</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Hits</span>
+                                              <span className="metric-value">{dbMetrics.cache.hits.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.cache.reads !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📖</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Reads</span>
+                                              <span className="metric-value">{dbMetrics.cache.reads.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.cache.hit_ratio !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📊</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Hit Ratio</span>
+                                              <span className="metric-value">{dbMetrics.cache.hit_ratio.toFixed(1)}%</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Queries Section (MySQL) */}
+                                  {dbMetrics.queries && (
+                                    <div className="metrics-section">
+                                      <h6>🔍 Queries</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.queries.total !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📊</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Total</span>
+                                              <span className="metric-value">{dbMetrics.queries.total.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.queries.slow !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🐌</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Slow Queries</span>
+                                              <span className="metric-value">{dbMetrics.queries.slow.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* System Section */}
+                                  {dbMetrics.system && (
+                                    <div className="metrics-section">
+                                      <h6>🖥️ System</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.system.cpu_count !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⚡</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">CPU Count</span>
+                                              <span className="metric-value">{dbMetrics.system.cpu_count}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.system.memory_total_kb !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🧠</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Total Memory</span>
+                                              <span className="metric-value">{(dbMetrics.system.memory_total_kb / (1024**2)).toFixed(2)} GB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.system.memory_available_kb !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">✅</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Available Memory</span>
+                                              <span className="metric-value">{(dbMetrics.system.memory_available_kb / (1024**2)).toFixed(2)} GB</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Replication & Healthy Replicas */}
+                                  {dbMetrics.replication && Object.keys(dbMetrics.replication).length > 0 && (
+                                    <div className="metrics-section">
+                                      <h6>🔄 Replication & Healthy Replicas</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.replication.healthy_replicas !== undefined && (
+                                          <div className="metric-value-card highlight-health">
+                                            <span className="metric-icon">✅</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Healthy Replicas</span>
+                                              <span className="metric-value">{dbMetrics.replication.healthy_replicas}/{dbMetrics.replication.total_replicas || 0}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.replication.health_percent !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📊</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Health %</span>
+                                              <span className="metric-value">{dbMetrics.replication.health_percent.toFixed(1)}%</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.replication.state !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🔗</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">State</span>
+                                              <span className="metric-value">{dbMetrics.replication.state}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.replication.lag_seconds !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">⏱️</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Replication Lag</span>
+                                              <span className="metric-value">{dbMetrics.replication.lag_seconds.toFixed(2)}s</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* InnoDB Section (MySQL) */}
+                                  {dbMetrics.innodb && (
+                                    <div className="metrics-section">
+                                      <h6>⚙️ InnoDB</h6>
+                                      <div className="metrics-grid-values">
+                                        {dbMetrics.innodb.buffer_pool_pages !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">📄</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Buffer Pool Pages</span>
+                                              <span className="metric-value">{dbMetrics.innodb.buffer_pool_pages.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {dbMetrics.innodb.buffer_pool_free_pages !== undefined && (
+                                          <div className="metric-value-card">
+                                            <span className="metric-icon">🆓</span>
+                                            <div className="metric-content">
+                                              <span className="metric-label">Free Pages</span>
+                                              <span className="metric-value">{dbMetrics.innodb.buffer_pool_free_pages.toLocaleString()}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  <div className="metrics-footer">
+                                    <small>Last updated: {dbMetrics.timestamp ? new Date(dbMetrics.timestamp).toLocaleString() : 'N/A'}</small>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="monitoring-disabled">
+                          <p>Monitoring is not enabled for this database.</p>
+                          <p className="monitoring-note">
+                            To enable monitoring, you need to create the database with <code>monitoring_enabled: true</code> in the configuration.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'actions' && (
+                <div className="tab-content">
+                  <div className="actions-grid">
+                    <div className="action-card">
+                      <h4>💻 Change Instance Size</h4>
+                      <p>Vertical scaling - Update CPU and memory allocation</p>
+                      <select
+                        className="select-large"
+                        defaultValue={selectedDb.size}
+                        onChange={(e) => {
+                          if (confirm(`Change instance size to ${e.target.value}? This will restart the database.`)) {
+                            updateDatabaseConfig(selectedDb.id, { size: e.target.value })
+                          } else {
+                            e.target.value = selectedDb.size
+                          }
+                        }}
+                      >
+                        <option value="db.t3.micro">💻 Micro - 0.5 CPU, 1GB RAM</option>
+                        <option value="db.t3.small">📊 Small - 1 CPU, 2GB RAM</option>
+                        <option value="db.t3.medium">🚀 Medium - 2 CPU, 4GB RAM</option>
+                        <option value="db.t3.large">⚡ Large - 2 CPU, 8GB RAM</option>
+                        <option value="db.t3.xlarge">🔥 XLarge - 4 CPU, 16GB RAM</option>
+                        <option value="db.t3.2xlarge">💪 2XLarge - 8 CPU, 32GB RAM</option>
+                      </select>
+                      <small style={{color: '#666', marginTop: '0.5rem'}}>Current: {selectedDb.size}</small>
+                    </div>
+
+                    <div className="action-card">
+                      <h4>💾 Expand Storage</h4>
+                      <p>Increase storage size (cannot be decreased)</p>
+                      <button
+                        className="btn-secondary"
+                        onClick={() => {
+                          const newSize = prompt(
+                            `Current storage: ${selectedDb.storage_gb} GB\nEnter new size (GB). Must be larger than current:`,
+                            selectedDb.storage_gb + 10
+                          )
+                          if (newSize) {
+                            const size = parseInt(newSize)
+                            if (size <= selectedDb.storage_gb) {
+                              showNotification('Storage size must be larger than current size', 'error')
+                            } else {
+                              updateDatabaseConfig(selectedDb.id, { storage_gb: size })
+                            }
+                          }
+                        }}
+                      >
+                        Expand Storage
+                      </button>
+                      <small style={{color: '#666', marginTop: '0.5rem'}}>Current: {selectedDb.storage_gb} GB</small>
+                    </div>
+
+                    <div className="action-card">
+                      <h4>⚖️ Scale Replicas</h4>
+                      <p>Horizontal scaling - Add or remove replicas</p>
+                      <button
+                        className="btn-secondary"
+                        onClick={() => {
+                          const n = prompt(`Current: ${selectedDb.replicas}. Enter new count:`, selectedDb.replicas)
+                          if (n) {
+                            const count = parseInt(n)
+                            if (count > 0 && count <= 10) {
+                              updateDatabaseConfig(selectedDb.id, { replicas: count })
+                            } else {
+                              showNotification('Replica count must be between 1 and 10', 'error')
+                            }
+                          }
+                        }}
+                      >
+                        Scale Replicas
+                      </button>
+                      <small style={{color: '#666', marginTop: '0.5rem'}}>Current: {selectedDb.replicas} replica(s)</small>
+                    </div>
+
+                    <div className="action-card">
+                      <h4>⏸️ Pause Database</h4>
+                      <p>Temporarily pause the database to save costs</p>
+                      <button
+                        className="btn-secondary"
+                        onClick={() => {
+                          pauseDatabase(selectedDb.id)
+                          setShowDetailsModal(false)
+                        }}
+                        disabled={selectedDb.status === 'paused'}
+                      >
+                        Pause
+                      </button>
+                    </div>
+
+                    <div className="action-card">
+                      <h4>▶️ Resume Database</h4>
+                      <p>Resume a paused database</p>
+                      <button
+                        className="btn-secondary"
+                        onClick={() => {
+                          resumeDatabase(selectedDb.id)
+                          setShowDetailsModal(false)
+                        }}
+                        disabled={selectedDb.status !== 'paused'}
+                      >
+                        Resume
+                      </button>
+                    </div>
+
+                    <div className="action-card danger">
+                      <h4>🗑️ Delete Database</h4>
+                      <p>Permanently delete this database and all data</p>
+                      <button
+                        className="btn-danger"
+                        onClick={() => deleteDatabase(selectedDb.id, selectedDb.name)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Notification Toast */}
+      {notification && (
+        <div className={`notification notification-${notification.type}`}>
+          {notification.message}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default App

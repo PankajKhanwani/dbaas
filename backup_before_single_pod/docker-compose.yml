@@ -1,0 +1,160 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kubedb-dbaas-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - MONGODB_URL=mongodb://mongodb:mongodb@mongodb:27017/kubedb_dbaas
+      - MONGODB_DATABASE=kubedb_dbaas
+      - REDIS_URL=redis://redis:6379/0
+      - K8S_IN_CLUSTER=false
+    volumes:
+      - ./app:/app/app
+      - ~/.kube/config:/root/.kube/config:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kubedb-dbaas-worker
+    command: python -m app.workers.operation_worker
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - MONGODB_URL=mongodb://mongodb:mongodb@mongodb:27017/kubedb_dbaas
+      - MONGODB_DATABASE=kubedb_dbaas
+      - REDIS_URL=redis://redis:6379/0
+      - K8S_IN_CLUSTER=false
+    volumes:
+      - ./app:/app/app
+      - ~/.kube/config:/root/.kube/config:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+
+  reconciler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kubedb-dbaas-reconciler
+    command: python -m app.workers.reconciliation_worker
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - MONGODB_URL=mongodb://mongodb:mongodb@mongodb:27017/kubedb_dbaas
+      - MONGODB_DATABASE=kubedb_dbaas
+      - REDIS_URL=redis://redis:6379/0
+      - K8S_IN_CLUSTER=false
+      - RECONCILIATION_INTERVAL=300
+    volumes:
+      - ./app:/app/app
+      - ~/.kube/config:/root/.kube/config:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: kubedb-dbaas-mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=mongodb
+      - MONGO_INITDB_ROOT_PASSWORD=mongodb
+      - MONGO_INITDB_DATABASE=kubedb_dbaas
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: kubedb-dbaas-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: kubedb-dbaas-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./k8s/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: kubedb-dbaas-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - kubedb-network
+    restart: unless-stopped
+
+networks:
+  kubedb-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  mongodb_config:
+  redis_data:
+  prometheus_data:
+  grafana_data:

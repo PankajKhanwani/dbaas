@@ -1,0 +1,158 @@
+# Default values for kubedb-dbaas
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Application configuration
+app:
+  name: kubedb-dbaas-api
+  replicaCount: 3
+
+  image:
+    repository: kubedb-dbaas-api
+    pullPolicy: IfNotPresent
+    tag: "latest"
+
+  env:
+    environment: "production"
+    debug: "false"
+    logLevel: "INFO"
+    host: "0.0.0.0"
+    port: 8000
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 8000
+
+  # LoadBalancer service
+  loadBalancer:
+    enabled: true
+    port: 80
+    targetPort: 8000
+
+  # Ingress configuration
+  ingress:
+    enabled: false
+    className: "nginx"
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    hosts:
+      - host: dbaas.yourdomain.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: kubedb-dbaas-tls
+        hosts:
+          - dbaas.yourdomain.com
+
+  # Health checks
+  livenessProbe:
+    httpGet:
+      path: /health/live
+      port: 8000
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /health/ready
+      port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  startupProbe:
+    httpGet:
+      path: /health/startup
+      port: 8000
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 30
+
+  # HPA configuration
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+
+# MongoDB configuration (KubeDB)
+mongodb:
+  enabled: true
+  name: kubedb-dbaas-mongodb
+  version: "7.0.21"
+  replicas: 3
+  replicaSet:
+    name: rs0
+  storage:
+    storageClassName: ""  # Use cluster default
+    size: 10Gi
+  terminationPolicy: WipeOut
+  auth:
+    username: mongodb
+    password: mongodb123!@#
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+# Redis configuration (KubeDB)
+redis:
+  enabled: true
+  name: kubedb-dbaas-redis
+  version: "7.2.4"
+  mode: Standalone
+  storage:
+    storageClassName: ""  # Use cluster default
+    size: 5Gi
+  terminationPolicy: WipeOut
+  auth:
+    password: redis123!@#
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+# Secrets
+secrets:
+  secretKey: "your-secret-key-change-this-in-production-min-32-chars"
+  jwtSecretKey: "your-jwt-secret-key-change-this-in-production-min-32-chars"
+
+# RBAC
+rbac:
+  create: true
+  serviceAccountName: kubedb-dbaas-sa
+
+# ConfigMap
+config:
+  corsOrigins: '["*"]'
+  corsAllowCredentials: "true"
+  corsAllowMethods: '["*"]'
+  corsAllowHeaders: '["*"]'
+  k8sInCluster: "true"
+  prometheusEnabled: "true"
+
+# Namespace
+namespace:
+  name: kubedb-dbaas
+  create: true

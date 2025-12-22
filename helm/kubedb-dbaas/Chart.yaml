@@ -1,0 +1,18 @@
+apiVersion: v2
+name: kubedb-dbaas
+description: Production-grade Database as a Service platform powered by KubeDB
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - kubedb
+  - dbaas
+  - database
+  - mongodb
+  - postgres
+  - mysql
+  - redis
+  - elasticsearch
+maintainers:
+  - name: CoreDGE Team
+    email: team@coredge.io

@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubedb-dbaas-worker
+  namespace: kubedb-dbaas
+  labels:
+    app: kubedb-dbaas-worker
+    version: v1.0.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: kubedb-dbaas-worker
+  template:
+    metadata:
+      labels:
+        app: kubedb-dbaas-worker
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: kubedb-dbaas-sa
+      containers:
+      - name: worker
+        image: kubedb-dbaas-api:latest
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-m", "app.workers.operation_worker"]
+        env:
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: ENVIRONMENT
+        - name: APP_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: APP_NAME
+        - name: APP_VERSION
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: APP_VERSION
+        - name: DEBUG
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: DEBUG
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: LOG_LEVEL
+        - name: MONGODB_URL
+          valueFrom:
+            secretKeyRef:
+              name: kubedb-dbaas-secret
+              key: MONGODB_URL
+        - name: MONGODB_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: MONGODB_DATABASE
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: kubedb-dbaas-secret
+              key: REDIS_URL
+        - name: K8S_IN_CLUSTER
+          valueFrom:
+            configMapKeyRef:
+              name: kubedb-dbaas-config
+              key: K8S_IN_CLUSTER
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pgrep -f "app.workers.operation_worker"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - kubedb-dbaas-worker
+              topologyKey: kubernetes.io/hostname
