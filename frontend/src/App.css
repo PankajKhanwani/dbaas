@@ -845,6 +845,20 @@ button:disabled {
   max-width: 900px;
 }
 
+.modal-content {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.98));
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-radius: 1.75rem;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(0, 0, 0, 0.05);
+  max-height: 90vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1px solid rgba(226, 232, 240, 0.6);
+}
+
 @keyframes slideUp {
   from {
     transform: translateY(100px);
@@ -879,7 +893,8 @@ button:disabled {
   margin-top: 0.25rem;
 }
 
-.modal-close {
+.modal-close,
+.close-btn {
   background: #f1f5f9;
   border: none;
   width: 32px;
@@ -891,7 +906,8 @@ button:disabled {
   transition: all 0.2s;
 }
 
-.modal-close:hover {
+.modal-close:hover,
+.close-btn:hover {
   background: #e2e8f0;
   color: #0f172a;
 }

@@ -269,7 +269,7 @@ class DatabaseService:
                 namespace=db.namespace,
                 labels={
                     **db.labels,
-                    "managed-by": "kubedb-dbaas",
+                    "app.kubernetes.io/managed-by": "kubedb-dbaas",
                     "domain": db.domain,
                     "project": db.project,
                     "database-id": db.id,
@@ -332,7 +332,7 @@ class DatabaseService:
                 namespace=db.namespace,
                 labels={
                     **db.labels,
-                    "managed-by": "kubedb-dbaas",
+                    "app.kubernetes.io/managed-by": "kubedb-dbaas",
                     "domain": db.domain,
                     "project": db.project,
                     "database-id": db.id,
@@ -1458,6 +1458,66 @@ class DatabaseService:
                 "database_id": db.id,
                 "message": "Could not fetch endpoint from Kubernetes service"
             }
+
+    async def update_database_upgrade_policy(
+        self, domain: str, project: str, database_id: str, upgrade_policy
+    ) -> bool:
+        """
+        Update the automated version upgrade policy for a database.
+
+        Args:
+            domain: Domain name
+            project: Project name
+            database_id: Database unique identifier
+            upgrade_policy: UpgradePolicy model with new policy settings
+
+        Returns:
+            True if update was successful
+
+        Raises:
+            ValueError: If database not found
+        """
+        logger.info(
+            "updating_database_upgrade_policy",
+            database_id=database_id,
+            domain=domain,
+            project=project,
+            strategy=upgrade_policy.strategy,
+        )
+
+        # Get database document
+        db_doc = await self.get_database(domain, project, database_id)
+        if not db_doc:
+            raise ValueError(f"Database not found: {database_id}")
+
+        # Update the upgrade policy in MongoDB
+        update_data = {
+            "upgrade_policy": upgrade_policy.model_dump(),
+            "updated_at": datetime.utcnow(),
+        }
+
+        result = await self.db["databases"].update_one(
+            {
+                "database_id": database_id,
+                "domain": domain,
+                "project": project,
+            },
+            {"$set": update_data},
+        )
+
+        if result.modified_count > 0:
+            logger.info(
+                "upgrade_policy_updated_successfully",
+                database_id=database_id,
+                strategy=upgrade_policy.strategy,
+            )
+            return True
+        else:
+            logger.warning(
+                "upgrade_policy_not_modified",
+                database_id=database_id,
+            )
+            return False
 
 
 # Global instance

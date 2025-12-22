@@ -164,6 +164,12 @@ class DatabaseReconciler:
                 providers_processed=len(databases_by_provider)
             )
 
+            # Cleanup old OpsRequests for all providers
+            try:
+                await self._cleanup_old_ops_requests(databases_by_provider)
+            except Exception as cleanup_error:
+                logger.error("ops_request_cleanup_failed", error=str(cleanup_error))
+
         except Exception as e:
             logger.error("reconciliation_failed", error=str(e), exc_info=True)
 
@@ -306,20 +312,66 @@ class DatabaseReconciler:
             is_ready = detailed_status.get("ready", False)
             ready_replicas = detailed_status.get("ready_replicas", 0)
             desired_replicas = detailed_status.get("replicas", db.replicas)
+            kubedb_version = detailed_status.get("version")  # Version from KubeDB resource
 
             # Check if status changed
             old_health_status = db.health_status
             old_status = db.status
             old_ready_replicas = db.ready_replicas
             old_replicas = db.replicas
+            old_version = db.version
 
             # Update health status
             db.health_status = phase
 
             # Update replica counts
-            # IMPORTANT: Update current_replicas, NOT replicas (desired state)!
-            db.current_replicas = desired_replicas
+            # IMPORTANT: Only update current_replicas if there's no active operation
+            # This prevents status sync from updating current_replicas while an OpsRequest
+            # is in progress, which would cause the reconciler to not detect drift
+            from app.models.operation import Operation, OperationStatus
+            active_operation = await Operation.find_one({
+                "database_id": db.id,
+                "status": {"$in": [
+                    OperationStatus.QUEUED.value,
+                    OperationStatus.IN_PROGRESS.value,
+                ]},
+            })
+            
+            # Only update current_replicas if no active operation is running
+            # This ensures reconciler can detect drift between desired (db.replicas) 
+            # and what's actually in K8s spec (desired_replicas from spec.replicas)
+            if not active_operation:
+                # No active operation - safe to update current_replicas from K8s spec
+                # This represents what KubeDB is trying to achieve
+                db.current_replicas = desired_replicas
+            # If there's an active operation, don't update current_replicas
+            # Let the operation worker update it when the OpsRequest completes
+            
             db.ready_replicas = ready_replicas
+            
+            # Update version if it changed in KubeDB (e.g., after upgrade)
+            if kubedb_version:
+                if kubedb_version != db.version:
+                    logger.info(
+                        "database_version_updated_from_kubedb",
+                        database_id=db.id,
+                        old_version=db.version,
+                        new_version=kubedb_version,
+                        kubedb_phase=phase,
+                    )
+                    db.version = kubedb_version
+                else:
+                    logger.debug(
+                        "database_version_unchanged",
+                        database_id=db.id,
+                        version=db.version,
+                    )
+            else:
+                logger.debug(
+                    "kubedb_version_not_available",
+                    database_id=db.id,
+                    current_db_version=db.version,
+                )
 
             # Check if there's an active operation for this database
             from app.models.operation import Operation, OperationStatus
@@ -475,6 +527,7 @@ class DatabaseReconciler:
                 old_status != db.status or
                 old_ready_replicas != db.ready_replicas or
                 old_replicas != db.replicas or
+                old_version != db.version or
                 (is_ready and not db.endpoint)):
                 
                 await db.save()
@@ -1135,6 +1188,141 @@ class DatabaseReconciler:
         else:
             # Default: keep updating status
             return DatabaseStatus.UPDATING
+
+    async def _cleanup_old_ops_requests(self, databases_by_provider: Dict[Optional[str], List[Database]]) -> None:
+        """
+        Clean up old OpsRequests for all databases.
+
+        Keeps the 3 most recent OpsRequests per database and deletes older ones
+        in terminal states (Successful, Failed, Skipped).
+
+        This includes cleaning up OpsRequests for deleted databases.
+
+        Args:
+            databases_by_provider: Dictionary mapping provider_id to list of databases (from reconciliation)
+        """
+        terminal_phases = ["Successful", "Failed", "Skipped"]
+        total_cleaned = 0
+
+        # Get ALL providers to ensure we clean up orphaned OpsRequests
+        all_providers = await Provider.find_all().to_list()
+
+        for provider in all_providers:
+            try:
+                # Get ALL databases for this provider (including DELETED ones)
+                provider_databases = await Database.find({"provider_id": provider.id}).to_list()
+
+                if not provider_databases:
+                    continue
+
+                client_set = await kubedb_service.get_client_for_provider(
+                    provider.id, provider.kubeconfig_content
+                )
+
+                for db in provider_databases:
+                    try:
+                        # Get all OpsRequests for this database
+                        # First try with label selector for OpsRequests we created
+                        try:
+                            items_labeled = await client_set.custom_api.list_namespaced_custom_object(
+                                group="ops.kubedb.com",
+                                version="v1alpha1",
+                                namespace=db.namespace,
+                                plural=kubedb_service._get_ops_request_plural(db.engine),
+                                label_selector="app.kubernetes.io/managed-by=kubedb-dbaas",
+                            )
+                            labeled_ops = items_labeled.get("items", [])
+                        except Exception:
+                            labeled_ops = []
+
+                        # Also get all OpsRequests to filter by name (for legacy OpsRequests without labels)
+                        items_all = await client_set.custom_api.list_namespaced_custom_object(
+                            group="ops.kubedb.com",
+                            version="v1alpha1",
+                            namespace=db.namespace,
+                            plural=kubedb_service._get_ops_request_plural(db.engine),
+                        )
+
+                        # Filter by name prefix for legacy OpsRequests
+                        all_ops = items_all.get("items", [])
+                        name_matched_ops = [
+                            item for item in all_ops
+                            if item.get("metadata", {}).get("name", "").startswith(f"{db.kubedb_resource_name}-")
+                        ]
+
+                        # Combine both: OpsRequests with our label OR matching name prefix
+                        # Use set to avoid duplicates
+                        ops_names = set()
+                        ops_list = []
+
+                        for item in labeled_ops + name_matched_ops:
+                            name = item.get("metadata", {}).get("name")
+                            if name and name not in ops_names:
+                                ops_names.add(name)
+                                ops_list.append(item)
+
+                        # Sort by creation timestamp (newest first)
+                        ops_list.sort(
+                            key=lambda x: x.get("metadata", {}).get("creationTimestamp", ""),
+                            reverse=True,
+                        )
+
+                        # Keep the 3 most recent, cleanup the rest if they're terminal
+                        if len(ops_list) > 3:
+                            old_ops_requests = [
+                                item for item in ops_list[3:]
+                                if item.get("status", {}).get("phase") in terminal_phases
+                            ]
+
+                            for old_ops in old_ops_requests:
+                                try:
+                                    ops_name = old_ops["metadata"]["name"]
+                                    await client_set.custom_api.delete_namespaced_custom_object(
+                                        group="ops.kubedb.com",
+                                        version="v1alpha1",
+                                        namespace=db.namespace,
+                                        plural=kubedb_service._get_ops_request_plural(db.engine),
+                                        name=ops_name,
+                                    )
+                                    total_cleaned += 1
+                                    logger.debug(
+                                        "cleaned_up_old_ops_request",
+                                        database_id=db.id,
+                                        database_name=db.name,
+                                        ops_request_name=ops_name,
+                                        phase=old_ops.get("status", {}).get("phase"),
+                                    )
+                                except Exception as e:
+                                    error_str = str(e).lower()
+                                    if "404" not in error_str and "not found" not in error_str:
+                                        logger.debug(
+                                            "failed_to_delete_ops_request",
+                                            ops_request_name=ops_name,
+                                            error=str(e),
+                                        )
+
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "404" not in error_str and "not found" not in error_str:
+                            logger.debug(
+                                "cleanup_check_failed_for_database",
+                                database_id=db.id,
+                                database_name=db.name,
+                                error=str(e),
+                            )
+
+            except Exception as e:
+                logger.debug(
+                    "cleanup_failed_for_provider",
+                    provider_id=provider.id,
+                    error=str(e),
+                )
+
+        if total_cleaned > 0:
+            logger.info(
+                "ops_requests_cleanup_completed",
+                total_cleaned=total_cleaned,
+            )
 
 
 # Global reconciler instance (replaces StatusSyncService)

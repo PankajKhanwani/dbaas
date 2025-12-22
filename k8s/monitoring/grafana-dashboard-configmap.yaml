@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-kubedb-database
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  kubedb-database-monitoring.json: |
+    # This file should contain the JSON from grafana-dashboard-database.json
+    # Grafana will auto-discover dashboards with label grafana_dashboard=1
+    # Copy the contents of grafana-dashboard-database.json here
+
