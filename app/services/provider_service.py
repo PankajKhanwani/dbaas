@@ -239,6 +239,12 @@ class ProviderService:
         # Invalidate cached client for this provider
         from app.services.kubedb_service import kubedb_service
         kubedb_service.invalidate_provider_cache(provider_id)
+        
+        # Invalidate version cache if kubeconfig changed (versions are cluster-specific)
+        if 'kubeconfig_content' in update_data or 'kubeconfig_path' in update_data:
+            from app.services.version_cache_service import version_cache_service
+            await version_cache_service.invalidate_provider_cache(provider_id)
+            logger.info("version_cache_invalidated_for_provider", provider_id=provider_id)
 
         logger.info("provider_updated", provider_id=provider.id)
         return provider

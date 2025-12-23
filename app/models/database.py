@@ -27,7 +27,9 @@ class DatabaseStatus(str, Enum):
     RUNNING = "running"
     UPDATING = "updating"
     SCALING = "scaling"
+    PAUSING = "pausing"  # Pausing in progress
     PAUSED = "paused"
+    RESUMING = "resuming"  # Resuming from paused state
     FAILED = "failed"
     DELETING = "deleting"
     DELETED = "deleted"

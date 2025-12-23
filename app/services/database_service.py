@@ -799,8 +799,9 @@ class DatabaseService:
             logger.info("database_already_paused", database_id=db.id)
             return self._to_response(db)
 
-        # Update database status
-        db.status = DatabaseStatus.PAUSED
+        # Update database status to PAUSING (transient state)
+        previous_status = db.status
+        db.status = DatabaseStatus.PAUSING
         await db.save()
 
         # Audit log
@@ -810,14 +811,14 @@ class DatabaseService:
             resource_id=db.id,
             domain=domain,
             project=project,
-            details={"previous_status": db.status.value},
+            details={"previous_status": previous_status.value},
         )
 
         # Reconciler will handle the actual pause
         logger.info(
             "database_pause_queued",
             database_id=db.id,
-            message="Reconciler will perform KubeDB pause"
+            message="Reconciler will perform KubeDB pause. Status set to PAUSING."
         )
 
         return self._to_response(db)
@@ -845,8 +846,8 @@ class DatabaseService:
             logger.info("database_not_paused", database_id=db.id, status=db.status)
             return self._to_response(db)
 
-        # Update database status
-        db.status = DatabaseStatus.PROVISIONING
+        # Update database status to RESUMING (transient state)
+        db.status = DatabaseStatus.RESUMING
         await db.save()
 
         # Audit log
@@ -863,7 +864,7 @@ class DatabaseService:
         logger.info(
             "database_resume_queued",
             database_id=db.id,
-            message="Reconciler will perform KubeDB resume"
+            message="Reconciler will perform KubeDB resume. Status set to RESUMING."
         )
 
         return self._to_response(db)

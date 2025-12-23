@@ -12,7 +12,7 @@ Reconciliation Pattern:
 5. Handle errors gracefully without stopping the reconciler
 """
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from collections import defaultdict
 
 from beanie import operators
@@ -105,8 +105,10 @@ class DatabaseReconciler:
                     DatabaseStatus.RUNNING,
                     DatabaseStatus.UPDATING,
                     DatabaseStatus.SCALING,
-                    DatabaseStatus.DELETING,
+                    DatabaseStatus.PAUSING,
                     DatabaseStatus.PAUSED,
+                    DatabaseStatus.RESUMING,
+                    DatabaseStatus.DELETING,
                 ])
             ).to_list()
 
@@ -298,13 +300,21 @@ class DatabaseReconciler:
                     # Database not created yet - reconciler will handle creation
                     # (creation is handled by _handle_database_creation in database_service)
                     return
+                elif db.status == DatabaseStatus.DELETED:
+                    # Already marked as deleted - just return
+                    return
                 else:
-                    logger.debug(
-                        "kubedb_resource_not_found",
+                    # Resource not found and status is RUNNING/UPDATING/etc
+                    # This means the resource was deleted outside our system
+                    # Mark as DELETED and clean up
+                    logger.warning(
+                        "kubedb_resource_not_found_marking_deleted",
                         database_id=db.id,
                         name=db.kubedb_resource_name,
-                        status=db.status.value,
+                        current_status=db.status.value,
                     )
+                    # Handle deletion to cleanup resources and remove record
+                    await self._handle_database_deletion(db, provider_id, kubeconfig_content)
                     return
 
             # Extract status information
@@ -313,6 +323,19 @@ class DatabaseReconciler:
             ready_replicas = detailed_status.get("ready_replicas", 0)
             desired_replicas = detailed_status.get("replicas", db.replicas)
             kubedb_version = detailed_status.get("version")  # Version from KubeDB resource
+            deletion_timestamp = detailed_status.get("deletionTimestamp")  # Check if being deleted
+
+            # If resource has deletionTimestamp, it's being deleted - set status and return
+            if deletion_timestamp:
+                logger.info(
+                    "database_resource_being_deleted",
+                    database_id=db.id,
+                    deletion_timestamp=deletion_timestamp,
+                )
+                if db.status != DatabaseStatus.DELETING:
+                    db.status = DatabaseStatus.DELETING
+                    await db.save()
+                return
 
             # Check if status changed
             old_health_status = db.health_status
@@ -325,27 +348,19 @@ class DatabaseReconciler:
             db.health_status = phase
 
             # Update replica counts
-            # IMPORTANT: Only update current_replicas if there's no active operation
-            # This prevents status sync from updating current_replicas while an OpsRequest
-            # is in progress, which would cause the reconciler to not detect drift
-            from app.models.operation import Operation, OperationStatus
-            active_operation = await Operation.find_one({
-                "database_id": db.id,
-                "status": {"$in": [
-                    OperationStatus.QUEUED.value,
-                    OperationStatus.IN_PROGRESS.value,
-                ]},
-            })
+            # Check if there's an active OpsRequest for this database
+            # If OpsRequest is in progress, don't update current_replicas yet
+            # (reconciler needs to detect drift)
+            has_active_ops_request = await self._has_active_ops_request(
+                db, provider_id, kubeconfig_content
+            )
             
-            # Only update current_replicas if no active operation is running
-            # This ensures reconciler can detect drift between desired (db.replicas) 
-            # and what's actually in K8s spec (desired_replicas from spec.replicas)
-            if not active_operation:
-                # No active operation - safe to update current_replicas from K8s spec
-                # This represents what KubeDB is trying to achieve
+            if not has_active_ops_request:
+                # No active OpsRequest - safe to update current_replicas from K8s spec
+                # This represents what KubeDB has achieved (spec.replicas)
                 db.current_replicas = desired_replicas
-            # If there's an active operation, don't update current_replicas
-            # Let the operation worker update it when the OpsRequest completes
+            # If there's an active OpsRequest, don't update current_replicas
+            # Let it be updated after OpsRequest completes (in next reconciliation cycle)
             
             db.ready_replicas = ready_replicas
             
@@ -373,39 +388,484 @@ class DatabaseReconciler:
                     current_db_version=db.version,
                 )
 
-            # Check if there's an active operation for this database
-            from app.models.operation import Operation, OperationStatus
+            # Update current_size from K8s CR resources
+            # This ensures current_size reflects the actual state in K8s
+            # Always update it - if there's an active OpsRequest, we'll update it after it completes
+            if db.size:
+                try:
+                    # Get client set for fetching CR
+                    client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                    
+                    # Get the CR to extract resources
+                    cr = await client_set.custom_api.get_namespaced_custom_object(
+                        group=kubedb_service._get_kubedb_group(db.engine),
+                        version=kubedb_service._get_kubedb_version(db.engine),
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_kubedb_plural(db.engine),
+                        name=db.kubedb_resource_name,
+                    )
+                    
+                    # Extract resources from CR
+                    cr_resources = None
+                    if "spec" in cr and "podTemplate" in cr["spec"]:
+                        containers = cr["spec"]["podTemplate"]["spec"].get("containers", [])
+                        for container in containers:
+                            if container.get("name") in ["mongodb", "postgres", "mysql", db.engine.value]:
+                                cr_resources = container.get("resources", {})
+                                break
+                    
+                    if cr_resources:
+                        # Get expected resources for current size
+                        expected_resources = kubedb_service._get_resource_limits(db.size)
+                        expected_cpu = str(expected_resources.get("cpu", ""))
+                        expected_memory = str(expected_resources.get("memory", ""))
+                        
+                        # Get actual resources from CR
+                        cr_requests = cr_resources.get("requests", {}) if cr_resources else {}
+                        cr_cpu = str(cr_requests.get("cpu", ""))
+                        cr_memory = str(cr_requests.get("memory", ""))
+                        
+                        # If CR resources match desired size, update current_size
+                        if cr_cpu == expected_cpu and cr_memory == expected_memory:
+                            if db.size != db.current_size:
+                                logger.info(
+                                    "updating_current_size_from_cr",
+                                    database_id=db.id,
+                                    old_current_size=db.current_size.value if db.current_size else None,
+                                    new_current_size=db.size.value,
+                                    cr_cpu=cr_cpu,
+                                    cr_memory=cr_memory,
+                                )
+                                db.current_size = db.size
+                        else:
+                            # CR resources don't match desired - try to determine size from CR
+                            from app.models.database import DatabaseSize
+                            cr_size = self._get_size_from_cr_resources(cr, db.engine.value)
+                            if cr_size and cr_size != db.current_size:
+                                logger.info(
+                                    "updating_current_size_from_cr_resources",
+                                    database_id=db.id,
+                                    old_current_size=db.current_size.value if db.current_size else None,
+                                    new_current_size=cr_size.value,
+                                    cr_cpu=cr_cpu,
+                                    cr_memory=cr_memory,
+                                )
+                                db.current_size = cr_size
+                except Exception as e:
+                    logger.debug(
+                        "failed_to_update_current_size_from_cr",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+
+            # Check if there's an active OpsRequest in K8s (source of truth for scaling operations)
+            # Scaling operations are now fire-and-forget, so we check K8s OpsRequests, not Operation records
+            # Also check for recently created OpsRequests (within last 60 seconds) to prevent race conditions
+            has_active_ops_request = await self._has_active_ops_request(
+                db, provider_id, kubeconfig_content
+            )
+            
+            # Also check for recently created OpsRequests (within last 60 seconds)
+            # This prevents status_sync_service from immediately overriding UPDATING status
+            # when PATCH endpoint just created an OpsRequest but it's not visible yet
+            has_recent_ops_request = False
+            if not has_active_ops_request and db.status == DatabaseStatus.UPDATING:
+                try:
+                    from datetime import datetime, timezone
+                    client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                    ops_requests = await client_set.custom_api.list_namespaced_custom_object(
+                        group="ops.kubedb.com",
+                        version="v1alpha1",
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_ops_request_plural(db.engine),
+                    )
+                    all_items = ops_requests.get("items", [])
+                    db_ops = [
+                        item for item in all_items
+                        if item.get("spec", {}).get("databaseRef", {}).get("name") == db.kubedb_resource_name
+                    ]
+                    
+                    now = datetime.now(timezone.utc)
+                    for item in db_ops:
+                        creation_time_str = item.get("metadata", {}).get("creationTimestamp", "")
+                        if creation_time_str:
+                            try:
+                                if creation_time_str.endswith("Z"):
+                                    creation_time_str_clean = creation_time_str[:-1] + "+00:00"
+                                else:
+                                    creation_time_str_clean = creation_time_str
+                                creation_time = datetime.fromisoformat(creation_time_str_clean)
+                                if creation_time.tzinfo is None:
+                                    creation_time = creation_time.replace(tzinfo=timezone.utc)
+                                age_seconds = (now - creation_time).total_seconds()
+                                # If created within last 60 seconds, treat as active
+                                if age_seconds < 60:
+                                    has_recent_ops_request = True
+                                    logger.debug(
+                                        "recent_ops_request_found_preserving_updating_status",
+                                        database_id=db.id,
+                                        ops_request_name=item.get("metadata", {}).get("name"),
+                                        age_seconds=age_seconds,
+                                    )
+                                    break
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug(
+                        "failed_to_check_recent_ops_request",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+
+            # Check for active Operation records (only for upgrade operations, not scaling)
+            # Also check for any upgrade operation that exists (even if not yet processed)
+            # This prevents false positives where upgrade was just initiated
+            from app.models.operation import Operation, OperationStatus, OperationType
             active_operation = await Operation.find_one({
                 "database_id": db.id,
                 "status": {"$in": [
                     OperationStatus.QUEUED.value,
                     OperationStatus.IN_PROGRESS.value,
                 ]},
+                "type": OperationType.UPGRADE_VERSION.value,  # Only check for upgrade operations
             })
+            
+            # Also check for any recent upgrade operation (created within last 5 minutes)
+            # This catches cases where upgrade was just initiated but Operation status hasn't been set yet
+            if not active_operation and db.status == DatabaseStatus.UPDATING:
+                from datetime import datetime, timezone, timedelta
+                recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+                recent_upgrade_operation = await Operation.find_one({
+                    "database_id": db.id,
+                    "type": OperationType.UPGRADE_VERSION.value,
+                    "created_at": {"$gte": recent_cutoff},
+                })
+                if recent_upgrade_operation:
+                    active_operation = recent_upgrade_operation
+                    logger.debug(
+                        "found_recent_upgrade_operation",
+                        database_id=db.id,
+                        operation_id=str(recent_upgrade_operation.id),
+                        operation_status=recent_upgrade_operation.status.value,
+                    )
 
             # Log for debugging
             logger.info(
                 "status_sync_checking_active_operation",
                 database_id=db.id,
+                has_active_ops_request=has_active_ops_request,
                 has_active_operation=bool(active_operation),
                 active_op_id=str(active_operation.id) if active_operation else None,
                 current_db_status=db.status.value,
                 kubedb_phase=phase,
+                is_ready=is_ready,
             )
 
-            # Only update status if no active operation or database was in error state
-            if active_operation:
-                # Keep status as UPDATING if there's an active operation
+            # Handle DELETING status - perform actual deletion
+            # The DELETE endpoint sets status to DELETING, and we need to actually delete the resource
+            if db.status == DatabaseStatus.DELETING:
+                logger.info(
+                    "database_status_deleting_performing_deletion",
+                    database_id=db.id,
+                    message="Database status is DELETING - performing actual deletion"
+                )
+                # Call deletion handler to delete KubeDB resource and clean up
+                await self._handle_database_deletion(
+                    db=db,
+                    provider_id=provider_id,
+                    kubeconfig_content=kubeconfig_content,
+                )
+                return  # Exit after deletion is handled
+
+            # Handle PAUSING/PAUSED/RESUMING status transitions based on K8s phase
+            if db.status == DatabaseStatus.PAUSING:
+                # Database is being paused - check if pause completed
+                if phase.lower() in ["halted", "paused"]:
+                    # Pause completed - update to PAUSED
+                    logger.info(
+                        "pause_completed_updating_to_paused",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                    )
+                    db.status = DatabaseStatus.PAUSED
+                    await db.save()
+                    return
+                else:
+                    # Database is not halted yet - need to pause it
+                    logger.info(
+                        "database_pausing_executing_pause",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                        message="Status is PAUSING and K8s is not Halted - pausing KubeDB resource",
+                    )
+                    try:
+                        await kubedb_service.pause_database(
+                            engine=db.engine,
+                            name=db.kubedb_resource_name,
+                            namespace=db.namespace,
+                            provider_id=provider_id,
+                            kubeconfig_content=kubeconfig_content,
+                        )
+                        logger.info(
+                            "database_pause_executed",
+                            database_id=db.id,
+                            message="KubeDB resource paused successfully",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "database_pause_failed",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+                    # Preserve PAUSING status - status_sync will update to PAUSED when K8s becomes Halted
+                    logger.debug(
+                        "preserving_pausing_status_after_pause_call",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                    )
+                    await db.save()
+                    return
+
+            elif db.status == DatabaseStatus.PAUSED:
+                # Database is paused - only preserve if K8s is still halted
+                # BUT: If user clicked resume, status should be RESUMING, not PAUSED
+                # So if status is PAUSED and K8s is halted, preserve it
+                # If status is PAUSED but K8s is not halted, it means it was resumed externally
+                if phase.lower() in ["halted", "paused"]:
+                    # K8s is still paused - preserve PAUSED status
+                    logger.debug(
+                        "preserving_paused_status_k8s_halted",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                    )
+                    await db.save()
+                    return
+                else:
+                    # K8s is NOT paused - database was resumed externally or resume is in progress
+                    # Check if there's a resume operation in progress
+                    # If not, update to RUNNING
+                    logger.info(
+                        "database_unpaused_externally_or_resuming",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                        is_ready=is_ready,
+                        message="K8s is not halted but status is PAUSED - likely resume in progress"
+                    )
+                    # Don't return - let status be updated below to RUNNING if ready
+
+            elif db.status == DatabaseStatus.RESUMING:
+                # Database is being resumed - check if resume completed
+                if phase.lower() in ["ready", "running"] and is_ready:
+                    # Resume completed - update to RUNNING
+                    logger.info(
+                        "resume_completed_updating_to_running",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                    )
+                    db.status = DatabaseStatus.RUNNING
+                    await db.save()
+                    return
+                elif phase.lower() in ["halted", "paused"]:
+                    # Database is halted - need to resume it
+                    logger.info(
+                        "database_resuming_executing_resume",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                        message="Status is RESUMING and K8s is Halted - resuming KubeDB resource",
+                    )
+                    try:
+                        await kubedb_service.resume_database(
+                            engine=db.engine,
+                            name=db.kubedb_resource_name,
+                            namespace=db.namespace,
+                            provider_id=provider_id,
+                            kubeconfig_content=kubeconfig_content,
+                        )
+                        logger.info(
+                            "database_resume_executed",
+                            database_id=db.id,
+                            message="KubeDB resource resumed successfully",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "database_resume_failed",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+                    # Preserve RESUMING status - status_sync will update to RUNNING when K8s becomes Ready
+                    logger.debug(
+                        "preserving_resuming_status_after_resume_call",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                    )
+                    await db.save()
+                    return
+                else:
+                    # In transition - preserve RESUMING status
+                    logger.debug(
+                        "preserving_resuming_status",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                    )
+                    await db.save()
+                    return
+
+            # Update status based on K8s state
+            # If K8s says Ready and no active OpsRequest, set to RUNNING
+            # Only keep UPDATING if there's an active OpsRequest, recent OpsRequest, or upgrade operation
+            # IMPORTANT: Don't override UPDATING status if it was just set (recent OpsRequest or status was UPDATING)
+            if has_active_ops_request or has_recent_ops_request or active_operation:
+                # Keep status as UPDATING if there's an active/recent OpsRequest or upgrade operation
                 if db.status != DatabaseStatus.UPDATING:
                     logger.info(
                         "setting_status_to_updating_due_to_active_operation",
                         database_id=db.id,
-                        operation_id=str(active_operation.id),
+                        has_active_ops_request=has_active_ops_request,
+                        has_recent_ops_request=has_recent_ops_request,
+                        has_active_operation=bool(active_operation),
+                        operation_id=str(active_operation.id) if active_operation else None,
                     )
                     db.status = DatabaseStatus.UPDATING
+            elif db.status == DatabaseStatus.UPDATING:
+                # Status is UPDATING but no active/recent OpsRequest found
+                # This could mean OpsRequest completed or was never created
+                # Check if OpsRequest actually completed by checking for successful ones
+                try:
+                    client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                    ops_requests = await client_set.custom_api.list_namespaced_custom_object(
+                        group="ops.kubedb.com",
+                        version="v1alpha1",
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_ops_request_plural(db.engine),
+                    )
+                    all_items = ops_requests.get("items", [])
+                    db_ops = [
+                        item for item in all_items
+                        if item.get("spec", {}).get("databaseRef", {}).get("name") == db.kubedb_resource_name
+                    ]
+                    
+                    # Check if most recent OpsRequest is successful
+                    if db_ops:
+                        db_ops.sort(
+                            key=lambda x: x.get("metadata", {}).get("creationTimestamp", ""),
+                            reverse=True
+                        )
+                        latest_ops = db_ops[0]
+                        latest_phase = latest_ops.get("status", {}).get("phase", "Unknown")
+                        
+                        # If latest OpsRequest is successful, it's safe to change to RUNNING
+                        if latest_phase == "Successful":
+                            mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
+                            db.status = mapped_status
+                            logger.info(
+                                "changing_status_from_updating_opsrequest_completed",
+                                database_id=db.id,
+                                new_status=mapped_status.value,
+                                kubedb_phase=phase,
+                            )
+                        else:
+                            # OpsRequest is still pending/progressing or failed - keep UPDATING
+                            logger.debug(
+                                "keeping_updating_status_opsrequest_not_complete",
+                                database_id=db.id,
+                                latest_phase=latest_phase,
+                            )
+                    else:
+                        # No OpsRequest found - might have been created but not visible yet
+                        # Or OpsRequest was never created - keep UPDATING for now
+                        # Reconciler will handle it
+                        logger.debug(
+                            "keeping_updating_status_no_opsrequest_found",
+                            database_id=db.id,
+                            message="No OpsRequest found - may have been just created or never created",
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "failed_to_check_opsrequest_for_status_update",
+                        database_id=db.id,
+                        error=str(e),
+                    )
             else:
-                # Map KubeDB phase to application status
-                db.status = self._map_kubedb_phase_to_status(phase, is_ready)
+                # No active operations and status is not UPDATING - map KubeDB phase to application status
+                # If K8s says Ready, database should be RUNNING
+                # BUT: If status was UPDATING and we're here, double-check there's no upgrade OpsRequest
+                # This prevents false positives where upgrade OpsRequest exists but wasn't detected
+                if old_status == DatabaseStatus.UPDATING:
+                    # Double-check for any upgrade OpsRequest before changing status
+                    try:
+                        client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                        ops_requests = await client_set.custom_api.list_namespaced_custom_object(
+                            group="ops.kubedb.com",
+                            version="v1alpha1",
+                            namespace=db.namespace,
+                            plural=kubedb_service._get_ops_request_plural(db.engine),
+                        )
+                        all_items = ops_requests.get("items", [])
+                        db_ops = [
+                            item for item in all_items
+                            if item.get("spec", {}).get("databaseRef", {}).get("name") == db.kubedb_resource_name
+                        ]
+                        
+                        # Check if any OpsRequest is for upgrade (has updateVersion field in spec)
+                        # or is in non-terminal state
+                        has_upgrade_ops = False
+                        for ops in db_ops:
+                            ops_phase = ops.get("status", {}).get("phase", "")
+                            # Check if it's a version upgrade OpsRequest
+                            spec = ops.get("spec", {})
+                            # Version upgrade OpsRequests have spec.updateVersion or spec.type == "UpdateVersion"
+                            if "updateVersion" in spec or spec.get("type") == "UpdateVersion":
+                                has_upgrade_ops = True
+                                logger.debug(
+                                    "found_upgrade_opsrequest_preserving_updating_status",
+                                    database_id=db.id,
+                                    ops_request_name=ops.get("metadata", {}).get("name"),
+                                    phase=ops_phase,
+                                )
+                                break
+                            # Also check if OpsRequest is in non-terminal state (could be upgrade or scaling)
+                            elif ops_phase not in ["Successful", "Failed", "Skipped"]:
+                                has_upgrade_ops = True
+                                logger.debug(
+                                    "found_active_opsrequest_preserving_updating_status",
+                                    database_id=db.id,
+                                    ops_request_name=ops.get("metadata", {}).get("name"),
+                                    phase=ops_phase,
+                                )
+                                break
+                        
+                        if has_upgrade_ops:
+                            # Keep UPDATING status - upgrade is still in progress
+                            logger.info(
+                                "preserving_updating_status_due_to_upgrade_opsrequest",
+                                database_id=db.id,
+                            )
+                            # Don't change status - keep it as UPDATING
+                            return  # Exit early to prevent status change
+                    except Exception as e:
+                        logger.debug(
+                            "failed_to_check_upgrade_opsrequest",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+                        # On error, be conservative - keep UPDATING status if it was UPDATING
+                        if old_status == DatabaseStatus.UPDATING:
+                            logger.info(
+                                "preserving_updating_status_on_error",
+                                database_id=db.id,
+                            )
+                            return  # Exit early to prevent status change
+                
+                # Safe to update status
+                mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
+                db.status = mapped_status
+                if mapped_status == DatabaseStatus.RUNNING:
+                    logger.info(
+                        "database_status_set_to_running",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                        is_ready=is_ready,
+                    )
 
             # If database became ready, fetch endpoint if not already set
             if is_ready and not db.endpoint:
@@ -457,7 +917,15 @@ class DatabaseReconciler:
                     )
                     operation_performed = True
             elif old_status == DatabaseStatus.PROVISIONING and phase.lower() == "halted":
-                # Database is halted but status is PROVISIONING - need to resume
+                # Database is halted but status is PROVISIONING - this means resume was requested
+                # Set status to RESUMING first, then call resume handler
+                logger.info(
+                    "provisioning_status_with_halted_phase_resuming",
+                    database_id=db.id,
+                    message="Status is PROVISIONING but K8s is halted - setting to RESUMING and resuming database"
+                )
+                db.status = DatabaseStatus.RESUMING
+                await db.save()
                 await self._handle_database_resume_operation(
                     db=db,
                     provider_id=provider_id,
@@ -466,28 +934,32 @@ class DatabaseReconciler:
                 operation_performed = True
 
             # Only update status from KubeDB phase if no operation is in progress
-            # This preserves operation status (UPDATING, SCALING, etc.) until operation completes
+            # This preserves operation status (UPDATING, SCALING, RESUMING, etc.) until operation completes
             if not operation_performed:
                 mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
                 # Only update if not in an operation state
+                # IMPORTANT: Don't override RESUMING or PAUSING status here - they're handled above
                 if old_status not in [
                     DatabaseStatus.UPDATING,
                     DatabaseStatus.SCALING,
                     DatabaseStatus.DELETING,
                     DatabaseStatus.PAUSED,
+                    DatabaseStatus.RESUMING,  # Preserve RESUMING status
+                    DatabaseStatus.PAUSING,     # Preserve PAUSING status
                 ]:
                     db.status = mapped_status
-                # If operation completed (status changed from operation state), update ONLY if no active operation
+                # If operation completed (status changed from operation state), update ONLY if no active OpsRequest or operation
                 elif old_status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING] and mapped_status == DatabaseStatus.RUNNING:
-                    # Double-check there's no active operation before changing to RUNNING
+                    # Double-check there's no active OpsRequest or upgrade operation before changing to RUNNING
                     logger.info(
                         "status_sync_operation_completion_check",
                         database_id=db.id,
                         old_status=old_status.value,
                         mapped_status=mapped_status.value,
+                        has_active_ops_request=has_active_ops_request,
                         has_active_operation=bool(active_operation),
                     )
-                    if not active_operation:
+                    if not has_active_ops_request and not active_operation:
                         logger.info(
                             "changing_status_to_running_no_active_operation",
                             database_id=db.id,
@@ -497,9 +969,28 @@ class DatabaseReconciler:
                         logger.info(
                             "keeping_updating_status_active_operation_exists",
                             database_id=db.id,
-                            operation_id=str(active_operation.id),
+                            has_active_ops_request=has_active_ops_request,
+                            operation_id=str(active_operation.id) if active_operation else None,
                         )
             
+            # Check OpsRequest status if database is in UPDATING or SCALING state
+            # This monitors OpsRequests created by PATCH endpoint and updates status when they complete
+            if db.status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING]:
+                try:
+                    await self._check_ops_request_status(
+                        db=db,
+                        provider_id=provider_id,
+                        kubeconfig_content=kubeconfig_content,
+                        is_ready=is_ready,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "ops_request_status_check_failed",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+                    # Don't fail the entire reconciliation if OpsRequest check fails
+
             # Reconcile resources/size to ensure pods match desired state
             # This ensures the database stays at the configured size
             # Run for RUNNING, UPDATING, and SCALING databases that are ready
@@ -773,8 +1264,102 @@ class DatabaseReconciler:
                     database_id=db.id,
                     ops_request_name=ops_request_name,
                 )
-                # Status will be updated to RUNNING by the main reconciler
-                # based on KubeDB resource phase
+                
+                # Update current_size from K8s CR resources (OpsRequest has updated them)
+                try:
+                    current_cr = await client_set.custom_api.get_namespaced_custom_object(
+                        group=kubedb_service._get_kubedb_group(db.engine),
+                        version=kubedb_service._get_kubedb_version(db.engine),
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_kubedb_plural(db.engine),
+                        name=db.kubedb_resource_name,
+                    )
+                    
+                    # Extract resources from CR
+                    cr_resources = None
+                    if "spec" in current_cr and "podTemplate" in current_cr["spec"]:
+                        containers = current_cr["spec"]["podTemplate"]["spec"].get("containers", [])
+                        for container in containers:
+                            if container.get("name") in ["mongodb", "postgres", "mysql", db.engine.value]:
+                                cr_resources = container.get("resources", {})
+                                break
+                    
+                    if cr_resources and db.size:
+                        # Get expected resources for desired size
+                        expected_resources = kubedb_service._get_resource_limits(db.size)
+                        expected_cpu = str(expected_resources.get("cpu", ""))
+                        expected_memory = str(expected_resources.get("memory", ""))
+                        
+                        # Get actual resources from CR
+                        cr_requests = cr_resources.get("requests", {})
+                        cr_cpu = str(cr_requests.get("cpu", ""))
+                        cr_memory = str(cr_requests.get("memory", ""))
+                        
+                        # If CR resources match desired size, update current_size
+                        if cr_cpu == expected_cpu and cr_memory == expected_memory:
+                            db.current_size = db.size
+                            logger.info(
+                                "current_size_updated_after_opsrequest_success",
+                                database_id=db.id,
+                                current_size=db.size.value,
+                            )
+                        else:
+                            # Determine size from CR resources
+                            cr_size = self._get_size_from_cr_resources(current_cr, db.engine.value)
+                            if cr_size:
+                                db.current_size = cr_size
+                                logger.info(
+                                    "current_size_updated_from_cr_after_opsrequest",
+                                    database_id=db.id,
+                                    current_size=cr_size.value,
+                                )
+                    
+                    # Update current_replicas from CR
+                    cr_replicas = current_cr.get("spec", {}).get("replicas", db.replicas)
+                    if cr_replicas != db.current_replicas:
+                        db.current_replicas = cr_replicas
+                        logger.info(
+                            "current_replicas_updated_after_opsrequest_success",
+                            database_id=db.id,
+                            current_replicas=cr_replicas,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "failed_to_update_current_state_after_opsrequest",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+                
+                # Update status to RUNNING if database is ready
+                # Check if database is ready by fetching detailed status
+                try:
+                    detailed_status = await kubedb_service.get_detailed_status(
+                        engine=db.engine,
+                        name=db.kubedb_resource_name,
+                        namespace=db.namespace,
+                        provider_id=provider_id,
+                        kubeconfig_content=kubeconfig_content,
+                    )
+                    db_is_ready = detailed_status.get("ready", False) if detailed_status else False
+                    db_phase = detailed_status.get("phase", "Unknown") if detailed_status else "Unknown"
+                    
+                    # Update status to RUNNING if database is ready and phase is Ready/Running
+                    if db_is_ready and db_phase.lower() in ["ready", "running"] and db.status == DatabaseStatus.UPDATING:
+                        db.status = DatabaseStatus.RUNNING
+                        logger.info(
+                            "database_status_updated_to_running_after_opsrequest",
+                            database_id=db.id,
+                            ops_request_name=ops_request_name,
+                            phase=db_phase,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "failed_to_check_database_ready_status",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+                
+                await db.save()
 
             elif phase == "Failed":
                 # OpsRequest failed
@@ -843,6 +1428,47 @@ class DatabaseReconciler:
                 error=str(e),
             )
             # Don't raise - this is a background check
+
+    async def _has_active_ops_request(
+        self,
+        db: Database,
+        provider_id: str,
+        kubeconfig_content: str,
+    ) -> bool:
+        """
+        Check if there's an active (non-terminal) OpsRequest for this database.
+        
+        Returns:
+            True if there's an active OpsRequest, False otherwise
+        """
+        try:
+            client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+
+            # List all OpsRequests in namespace
+            ops_requests = await client_set.custom_api.list_namespaced_custom_object(
+                group="ops.kubedb.com",
+                version="v1alpha1",
+                namespace=db.namespace,
+                plural=kubedb_service._get_ops_request_plural(db.engine),
+            )
+
+            # Filter OpsRequests that target this database and are not in terminal states
+            all_items = ops_requests.get("items", [])
+            active_ops = [
+                item for item in all_items
+                if item.get("spec", {}).get("databaseRef", {}).get("name") == db.kubedb_resource_name
+                and item.get("status", {}).get("phase") not in ["Successful", "Failed", "Skipped"]
+            ]
+
+            return len(active_ops) > 0
+        except Exception as e:
+            logger.debug(
+                "failed_to_check_active_ops_request",
+                database_id=db.id,
+                error=str(e),
+            )
+            # On error, assume no active OpsRequest (safer to update current_replicas)
+            return False
 
     async def _handle_database_update_operation(
         self,
@@ -968,7 +1594,21 @@ class DatabaseReconciler:
                 })
 
                 if not active_operation:
-                    # Only update status to RUNNING if no active operations
+                    # Before setting to RUNNING, check if replicas match (for scaling operations)
+                    if db.status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING]:
+                        # Check if ready_replicas matches desired replicas
+                        if ready_replicas < db.replicas:
+                            logger.info(
+                                "database_still_scaling_replicas",
+                                database_id=db.id,
+                                ready_replicas=ready_replicas,
+                                desired_replicas=db.replicas,
+                                message="Preserving UPDATING/SCALING status until all replicas are ready",
+                            )
+                            await db.save()
+                            return
+
+                    # Only update status to RUNNING if no active operations and replicas match
                     logger.info(
                         "database_up_to_date_setting_running",
                         database_id=db.id,
@@ -1160,6 +1800,58 @@ class DatabaseReconciler:
             )
             db.status = DatabaseStatus.FAILED
             await db.save()
+
+    def _get_size_from_cr_resources(self, cr: Dict[str, Any], engine: str) -> Optional:
+        """
+        Determine DatabaseSize from CR resources.
+
+        Converts CR resources back to DatabaseSize enum.
+        """
+        from app.models.database import DatabaseSize
+
+        # Extract resources from CR
+        cr_resources = None
+        if "spec" in cr and "podTemplate" in cr["spec"]:
+            containers = cr["spec"]["podTemplate"]["spec"].get("containers", [])
+            for container in containers:
+                # Match by engine name (mongodb, postgres, etc.)
+                if container.get("name") in ["mongodb", "postgres", "mysql", engine]:
+                    cr_resources = container.get("resources", {})
+                    break
+
+        if not cr_resources or "requests" not in cr_resources:
+            return None
+
+        requests = cr_resources["requests"]
+        cpu = requests.get("cpu", "")
+        memory = requests.get("memory", "")
+
+        # Map resources to DatabaseSize (approximate matching)
+        # This is reverse lookup - from resources to size
+        size_mapping = {
+            ("500m", "1Gi"): DatabaseSize.MICRO,
+            ("1", "2Gi"): DatabaseSize.SMALL,
+            ("2", "4Gi"): DatabaseSize.MEDIUM,
+            ("2", "8Gi"): DatabaseSize.LARGE,
+            ("4", "16Gi"): DatabaseSize.XLARGE,
+            ("8", "32Gi"): DatabaseSize.XXLARGE,
+        }
+
+        # Normalize CPU (remove 'm' suffix for comparison)
+        cpu_normalized = cpu.replace("m", "") if cpu.endswith("m") else cpu
+        # Try exact match first
+        size = size_mapping.get((cpu, memory))
+        if size:
+            return size
+
+        # Try normalized CPU match
+        for (map_cpu, map_memory), map_size in size_mapping.items():
+            map_cpu_normalized = map_cpu.replace("m", "") if map_cpu.endswith("m") else map_cpu
+            if map_cpu_normalized == cpu_normalized and map_memory == memory:
+                return map_size
+
+        # No match found
+        return None
 
     def _map_kubedb_phase_to_status(self, phase: str, is_ready: bool) -> DatabaseStatus:
         """

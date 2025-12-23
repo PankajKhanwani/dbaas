@@ -1481,6 +1481,7 @@ class KubeDBService:
             "replicas": desired_replicas,
             "ready_replicas": ready_replicas,
             "version": version,  # Current version from KubeDB resource
+            "spec_halted": spec.get("halted", False),  # Check if database is paused
         }
 
     async def _get_resource_events(
@@ -3257,6 +3258,7 @@ class KubeDBService:
         engine: DatabaseEngine,
         provider_id: Optional[str] = None,
         kubeconfig_content: Optional[str] = None,
+        use_cache: bool = True,
     ) -> Dict[str, list]:
         """
         Get available database versions from KubeDB version CRDs in the cluster.
@@ -3265,12 +3267,11 @@ class KubeDBService:
             engine: Database engine type
             provider_id: Provider ID for multi-cluster support
             kubeconfig_content: Provider's kubeconfig content
+            use_cache: Whether to use cache (default: True)
 
         Returns:
             Dictionary with engine name and list of available versions
         """
-        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
-
         # Map engine to KubeDB version CRD kind
         version_kind_map = {
             DatabaseEngine.MONGODB: "MongoDBVersion",
@@ -3285,6 +3286,97 @@ class KubeDBService:
             engine_name = engine.value if engine else "unknown"
             logger.warning("unsupported_engine_for_version_query", engine=engine_name)
             return {"engine": engine_name, "versions": []}
+
+        # Use cache if enabled and provider_id is available
+        if use_cache and provider_id:
+            from app.services.version_cache_service import version_cache_service
+            
+            async def fetch_from_k8s():
+                """Fetch versions from Kubernetes API."""
+                client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+                
+                try:
+                    # Query the KubeDB version CRD from catalog.kubedb.com
+                    versions_response = await client_set.custom_api.list_cluster_custom_object(
+                        group="catalog.kubedb.com",
+                        version="v1alpha1",
+                        plural=f"{kind.lower()}s",
+                    )
+
+                    versions = []
+                    for item in versions_response.get("items", []):
+                        version_name = item.get("metadata", {}).get("name", "")
+                        spec = item.get("spec", {})
+                        version_value = spec.get("version", version_name)
+                        deprecated = spec.get("deprecated", False)
+
+                        if not deprecated:  # Only return non-deprecated versions
+                            versions.append({
+                                "name": version_name,
+                                "version": version_value,
+                                "deprecated": deprecated,
+                            })
+
+                    # Sort versions (newest first)
+                    versions.sort(key=lambda x: x["version"], reverse=True)
+
+                    logger.info(
+                        "fetched_available_versions",
+                        engine=engine.value,
+                        provider_id=provider_id,
+                        count=len(versions),
+                    )
+
+                    return {
+                        "engine": engine.value,
+                        "versions": versions,
+                    }
+
+                except ApiException as e:
+                    if e.status == 404:
+                        logger.warning(
+                            "version_crd_not_found",
+                            engine=engine.value,
+                            kind=kind,
+                            provider_id=provider_id,
+                        )
+                        return {
+                            "engine": engine.value,
+                            "versions": [],
+                            "error": f"KubeDB {kind} CRD not found in cluster"
+                        }
+                    else:
+                        logger.error(
+                            "failed_to_fetch_versions",
+                            engine=engine.value,
+                            error=str(e),
+                            provider_id=provider_id,
+                        )
+                        raise KubernetesError(f"Failed to fetch versions for {engine.value}: {str(e)}")
+                except Exception as e:
+                    logger.error(
+                        "unexpected_error_fetching_versions",
+                        engine=engine.value,
+                        error=str(e),
+                        provider_id=provider_id,
+                        exc_info=True,
+                    )
+                    raise KubernetesError(f"Failed to fetch versions for {engine.value}: {str(e)}")
+            
+            # Use cache service
+            versions = await version_cache_service.get_versions(
+                engine=engine.value,
+                provider_id=provider_id,
+                fetch_fn=fetch_from_k8s,
+            )
+            
+            return {
+                "engine": engine.value,
+                "versions": versions,
+            }
+        
+        # Fallback: Direct fetch without cache (for backward compatibility)
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
 
         try:
             # Query the KubeDB version CRD from catalog.kubedb.com

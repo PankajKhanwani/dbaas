@@ -229,10 +229,224 @@ async def update_database(
     - Scaling operations may cause brief interruption
     - Backup/monitoring changes are metadata-only (no restart)
     - Updates are applied asynchronously via KubeDB
+    
+    **Immediate Feedback:**
+    - If scaling is needed, status changes to "UPDATING" immediately
+    - OpsRequest is created immediately (fire-and-forget)
+    - Background worker monitors and updates status back to "RUNNING" when complete
     """
-    result = await database_service.update_database(
-        database_id, update_data, domain_name, project_name
-    )
+    from app.repositories.models import Database, Provider
+    from app.models.database import DatabaseStatus, DatabaseSize
+    from app.services.kubedb_service import kubedb_service
+    
+    # Get database
+    db = await Database.find_one({"_id": database_id, "domain": domain_name, "project": project_name})
+    if not db:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Database {database_id} not found"
+        )
+    
+    # Update desired state first
+    old_size = db.size
+    old_replicas = db.replicas
+    old_storage = db.storage_gb
+    
+    if update_data:
+        if update_data.size is not None:
+            db.size = update_data.size
+        if update_data.replicas is not None:
+            db.replicas = update_data.replicas
+        if update_data.storage_gb is not None:
+            db.storage_gb = update_data.storage_gb
+        if update_data.backup_enabled is not None:
+            db.backup_enabled = update_data.backup_enabled
+        if update_data.backup_schedule is not None:
+            db.backup_schedule = update_data.backup_schedule
+        if update_data.monitoring_enabled is not None:
+            db.monitoring_enabled = update_data.monitoring_enabled
+        if update_data.labels is not None:
+            db.labels = update_data.labels
+        if update_data.annotations is not None:
+            db.annotations = update_data.annotations
+    
+    # Check if scaling parameters changed
+    size_changed = old_size != db.size
+    replicas_changed = old_replicas != db.replicas
+    storage_changed = old_storage != db.storage_gb
+    
+    # If scaling parameters changed, set status to UPDATING immediately and create OpsRequest in background
+    if size_changed or replicas_changed or storage_changed:
+        # Set status to UPDATING immediately for instant feedback
+        db.status = DatabaseStatus.UPDATING
+        await db.save()
+        
+        logger.info(
+            "database_status_set_to_updating_immediate",
+            database_id=db.id,
+            size_changed=size_changed,
+            replicas_changed=replicas_changed,
+            storage_changed=storage_changed,
+            message="Status set to UPDATING immediately - OpsRequest will be created in background",
+        )
+        
+        # Create OpsRequest immediately in background (fire-and-forget)
+        # Check for active OpsRequests to prevent duplicates
+        async def create_ops_requests_background():
+            """Create OpsRequests in background - check for active ones first to prevent duplicates."""
+            try:
+                # Get provider for kubeconfig
+                provider = await Provider.find_one({"_id": db.provider_id})
+                if not provider:
+                    logger.error(
+                        "provider_not_found_for_opsrequest",
+                        database_id=db.id,
+                        provider_id=db.provider_id,
+                    )
+                    return
+                
+                kubeconfig_content = provider.kubeconfig_content
+                client_set = await kubedb_service.get_client_for_provider(provider.id, kubeconfig_content)
+                
+                # CRITICAL: Check for active OpsRequests before creating new ones
+                # KubeDB can only process one OpsRequest at a time
+                # This prevents duplicate OpsRequests that cause pods to restart multiple times
+                try:
+                    existing_ops_requests = await client_set.custom_api.list_namespaced_custom_object(
+                        group="ops.kubedb.com",
+                        version="v1alpha1",
+                        namespace=db.namespace,
+                        plural=kubedb_service._get_ops_request_plural(db.engine),
+                    )
+                    
+                    # Filter OpsRequests that target this database
+                    all_items = existing_ops_requests.get("items", [])
+                    db_ops = [
+                        item for item in all_items
+                        if item.get("spec", {}).get("databaseRef", {}).get("name") == db.kubedb_resource_name
+                    ]
+                    
+                    # Check for active (non-terminal) OpsRequests
+                    active_ops = [
+                        item for item in db_ops
+                        if item.get("status", {}).get("phase") not in ["Successful", "Failed", "Skipped"]
+                    ]
+                    
+                    if active_ops:
+                        # There's already an active OpsRequest - skip creating new ones
+                        active_ops_names = [op.get("metadata", {}).get("name", "Unknown") for op in active_ops]
+                        active_phases = [op.get("status", {}).get("phase", "Unknown") for op in active_ops]
+                        logger.warning(
+                            "active_ops_request_exists_skipping_creation",
+                            database_id=db.id,
+                            active_ops_requests=active_ops_names,
+                            active_phases=active_phases,
+                            message="Active OpsRequest(s) already exist - skipping to prevent duplicate operations and multiple pod restarts",
+                        )
+                        return  # Skip - let existing OpsRequest complete
+                except Exception as e:
+                    logger.warning(
+                        "failed_to_check_active_ops_requests",
+                        database_id=db.id,
+                        error=str(e),
+                        message="Proceeding with OpsRequest creation despite check failure",
+                    )
+                    # Continue - if check fails, proceed (better to create than miss an update)
+                
+                ops_requests_created = []
+                
+                # Create OpsRequest(s) only if no active ones exist
+                if size_changed and db.size:
+                    try:
+                        ops_request = await kubedb_service.create_vertical_scaling_ops_request(
+                            engine=db.engine,
+                            name=db.kubedb_resource_name,
+                            namespace=db.namespace,
+                            size=db.size,
+                            provider_id=provider.id,
+                            kubeconfig_content=kubeconfig_content,
+                        )
+                        ops_requests_created.append(ops_request.get("metadata", {}).get("name") if isinstance(ops_request, dict) else None)
+                        logger.info(
+                            "vertical_scaling_opsrequest_created_background",
+                            database_id=db.id,
+                            size=db.size.value,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "failed_to_create_vertical_scaling_opsrequest",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+                
+                if replicas_changed:
+                    try:
+                        ops_request = await kubedb_service.create_horizontal_scaling_ops_request(
+                            engine=db.engine,
+                            name=db.kubedb_resource_name,
+                            namespace=db.namespace,
+                            replicas=db.replicas,
+                            provider_id=provider.id,
+                            kubeconfig_content=kubeconfig_content,
+                        )
+                        ops_requests_created.append(ops_request.get("metadata", {}).get("name") if isinstance(ops_request, dict) else None)
+                        logger.info(
+                            "horizontal_scaling_opsrequest_created_background",
+                            database_id=db.id,
+                            replicas=db.replicas,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "failed_to_create_horizontal_scaling_opsrequest",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+                
+                if storage_changed and db.storage_gb:
+                    try:
+                        await kubedb_service.patch_database(
+                            engine=db.engine,
+                            name=db.kubedb_resource_name,
+                            namespace=db.namespace,
+                            storage_gb=db.storage_gb,
+                            provider_id=provider.id,
+                            kubeconfig_content=kubeconfig_content,
+                        )
+                        logger.info(
+                            "storage_expansion_applied_background",
+                            database_id=db.id,
+                            storage_gb=db.storage_gb,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "failed_to_expand_storage",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+                
+                if ops_requests_created:
+                    logger.info(
+                        "database_opsrequests_created_background",
+                        database_id=db.id,
+                        ops_requests=ops_requests_created,
+                        message="OpsRequest(s) created in background",
+                    )
+            
+            except Exception as e:
+                logger.error(
+                    "failed_to_create_opsrequest_background",
+                    database_id=db.id,
+                    error=str(e),
+                    exc_info=True,
+                )
+        
+        # Start background task (fire-and-forget) - runs immediately, doesn't block response
+        import asyncio
+        asyncio.create_task(create_ops_requests_background())
+    
+    # Save database (for non-scaling updates like backup settings, labels, etc.)
+    if not (size_changed or replicas_changed or storage_changed):
+        await db.save()
     
     # Audit log
     audit_info = await _get_audit_info(request)
@@ -246,7 +460,11 @@ async def update_database(
         details=update_data.model_dump(exclude_none=True) if update_data else {},
     )
     
-    return result
+    # Return database response directly from db object we already have
+    # Don't call get_database() as it syncs status from KubeDB and would overwrite UPDATING status
+    # Reload db to ensure we have the latest state (including the UPDATING status we just set)
+    db = await Database.find_one({"_id": database_id, "domain": domain_name, "project": project_name})
+    return database_service._to_response(db)
 
 
 @router.delete("/{database_id}", status_code=status.HTTP_202_ACCEPTED)
@@ -297,7 +515,6 @@ async def scale_database(
     # Get the database first
     from app.repositories.models import Database
     from app.models.database import DatabaseStatus
-    from app.models.operation import Operation, OperationType, OperationStatus
     
     db = await Database.find_one({"_id": database_id, "domain": domain_name, "project": project_name})
     if not db:
@@ -306,7 +523,7 @@ async def scale_database(
             "database_id": database_id,
         }
 
-    # Update desired state via service
+    # Update desired state via service (reconciler will handle OpsRequest creation)
     result = await database_service.scale_database(database_id, scale_request, domain_name, project_name)
     
     # Audit log
@@ -321,105 +538,18 @@ async def scale_database(
         details=scale_request.model_dump(exclude_none=True) if scale_request else {},
     )
 
-    # Create operations for each scaling type and enqueue them
-    from app.services.operation_queue import operation_queue
+    # Update database status to UPDATING (reconciler will create OpsRequest)
+    db.status = DatabaseStatus.UPDATING
+    await db.save()
     
-    operations_created = []
-    
-    if scale_request and scale_request.replicas:
-        # Horizontal scaling operation
-        operation = Operation(
-            database_id=database_id,
-            type=OperationType.SCALE_HORIZONTAL,
-            desired_state={"replicas": scale_request.replicas},
-            status=OperationStatus.QUEUED,
-            domain=domain_name,
-            project=project_name,
-            created_by="api",
-        )
-        await operation.insert()
-        operations_created.append(operation.id)
-        
-        # Enqueue operation
-        await operation_queue.enqueue(
-            operation.id,
-            priority=5,
-            dedup_key=f"{database_id}:scale_horizontal"
-        )
-        logger.info(
-            "horizontal_scaling_operation_created",
-            operation_id=operation.id,
-            database_id=database_id,
-            target_replicas=scale_request.replicas,
-        )
+    logger.info(
+        "database_desired_state_updated",
+        database_id=database_id,
+        message="Desired state updated. Reconciler will create OpsRequest if needed.",
+        scale_request=scale_request.model_dump(exclude_none=True) if scale_request else {},
+    )
 
-    if scale_request and scale_request.size:
-        # Vertical scaling operation
-        operation = Operation(
-            database_id=database_id,
-            type=OperationType.SCALE_VERTICAL,
-            desired_state={"size": scale_request.size.value},
-            status=OperationStatus.QUEUED,
-            domain=domain_name,
-            project=project_name,
-            created_by="api",
-        )
-        await operation.insert()
-        operations_created.append(operation.id)
-        
-        # Enqueue operation
-        await operation_queue.enqueue(
-            operation.id,
-            priority=5,
-            dedup_key=f"{database_id}:scale_vertical"
-        )
-        logger.info(
-            "vertical_scaling_operation_created",
-            operation_id=operation.id,
-            database_id=database_id,
-            target_size=scale_request.size.value,
-        )
-
-    if scale_request and scale_request.storage_gb:
-        # Storage expansion operation
-        operation = Operation(
-            database_id=database_id,
-            type=OperationType.EXPAND_STORAGE,
-            desired_state={"storage_gb": scale_request.storage_gb},
-            status=OperationStatus.QUEUED,
-            domain=domain_name,
-            project=project_name,
-            created_by="api",
-        )
-        await operation.insert()
-        operations_created.append(operation.id)
-        
-        # Enqueue operation
-        await operation_queue.enqueue(
-            operation.id,
-            priority=5,
-            dedup_key=f"{database_id}:expand_storage"
-        )
-        logger.info(
-            "storage_expansion_operation_created",
-            operation_id=operation.id,
-            database_id=database_id,
-            target_storage_gb=scale_request.storage_gb,
-        )
-
-    # Update database status to UPDATING if any operations were created
-    if operations_created:
-        db.status = DatabaseStatus.UPDATING
-        await db.save()
-        logger.info(
-            "database_scaling_initiated",
-            database_id=database_id,
-            operation_count=len(operations_created),
-            operation_ids=operations_created,
-        )
-
-    # Return result with operation IDs
-    # Convert DatabaseResponse to dict and add operation info
+    # Return result
     if hasattr(result, 'model_dump'):
         result_dict = result.model_dump()
     elif hasattr(result, 'dict'):
@@ -427,11 +557,7 @@ async def scale_database(
     else:
         result_dict = dict(result)
     
-    result_dict["operation_ids"] = operations_created
-    if operations_created:
-        result_dict["message"] = f"Scaling initiated. {len(operations_created)} operation(s) created and queued."
-    else:
-        result_dict["message"] = "Database desired state updated. No operations required."
+    result_dict["message"] = "Desired state updated. Reconciler will reconcile and create OpsRequest if needed."
     
     return result_dict
 
@@ -503,12 +629,15 @@ async def get_database_status(
     domain_name: str = Path(..., description="Domain name"),
     project_name: str = Path(..., description="Project name"),
     database_id: str = Path(..., description="Database ID"),
+    realtime: bool = Query(False, description="Fetch real-time status from Kubernetes (slower)"),
 ):
     """
-    Get real-time database status from KubeDB.
+    Get database status.
 
-    Fetches the current status directly from the Kubernetes resource,
-    not just from the cached database record.
+    By default, returns cached status from MongoDB (updated every 30 seconds by status_sync).
+    This is fast and sufficient for most use cases.
+
+    Set realtime=true to fetch directly from Kubernetes (slower but most up-to-date).
 
     Returns:
     - KubeDB phase (Provisioning, Ready, Running, Failed, etc.)
@@ -516,13 +645,34 @@ async def get_database_status(
     - Ready status (boolean)
     - Health status
     - Endpoint information
-    - Conditions (detailed status conditions from Kubernetes)
+    - Conditions (detailed status conditions from Kubernetes) - only with realtime=true
 
     This endpoint is useful for monitoring database provisioning progress.
     """
-    return await database_service.get_database_status_realtime(
-        database_id, domain_name, project_name
-    )
+    if realtime:
+        # Slow path - fetch from Kubernetes
+        return await database_service.get_database_status_realtime(
+            database_id, domain_name, project_name
+        )
+    else:
+        # Fast path - return cached status from MongoDB
+        db = await database_service.get_database(database_id, domain_name, project_name)
+        return {
+            "database_id": db.id,
+            "name": db.name,
+            "status": db.status,
+            "health_status": db.health_status,
+            "endpoint": db.endpoint,
+            "port": db.port,
+            "replicas": {
+                "desired": db.replicas,
+                "ready": db.ready_replicas,
+                "status": f"{db.ready_replicas}/{db.replicas}",
+            },
+            "updated_at": db.updated_at.isoformat() if db.updated_at else None,
+            "cached": True,
+            "message": "Cached status (updated every 30s). Use ?realtime=true for real-time K8s status.",
+        }
 
 
 @router.get("/{database_id}/credentials", response_model=DatabaseCredentials)
@@ -684,6 +834,11 @@ async def get_available_upgrades(
 
     Returns a list of versions that the database can be upgraded to,
     based on the current version and upgrade compatibility.
+    
+    **Optimized Performance:**
+    - Uses Redis cache for version data (2-hour TTL)
+    - Parallel database and provider fetching
+    - Direct provider_id usage (no region/AZ lookup)
     """
     logger.info(
         "fetching_available_upgrades",
@@ -692,41 +847,52 @@ async def get_available_upgrades(
         project=project_name,
     )
 
-    # Get the database to know its current version and engine
-    db_doc = await database_service.get_database(database_id, domain_name, project_name)
-    if not db_doc:
-        return {"available_upgrades": [], "message": "Database not found"}
-
-    current_version = db_doc.version
-    engine = db_doc.engine
-
-    # Get provider info for region/AZ
     from app.repositories.models import Database, Provider
+    from app.services.version_cache_service import version_cache_service
+
+    # Optimize: Fetch database first (needed to get provider_id)
     db = await Database.find_one({"_id": database_id, "domain": domain_name, "project": project_name})
+    
     if not db:
         return {"available_upgrades": [], "message": "Database not found"}
 
-    provider = await Provider.find_one({"_id": db.provider_id})
+    current_version = db.version
+    engine = db.engine
+    provider_id = db.provider_id
+
+    # Fetch provider (needed for kubeconfig if cache miss)
+    # Note: We fetch provider after db because we need provider_id from db
+    # But this is still fast since it's just one MongoDB query
+    provider = await Provider.find_one({"_id": provider_id})
     if not provider:
         return {"available_upgrades": [], "message": "Provider not found"}
 
-    region = provider.region
-    availability_zone = provider.availability_zone
+    engine_str = engine.value if hasattr(engine, 'value') else str(engine)
 
     logger.info(
         "fetching_available_versions_for_engine",
-        engine=engine.value if hasattr(engine, 'value') else engine,
+        engine=engine_str,
         current_version=current_version,
-        region=region,
-        az=availability_zone,
+        provider_id=provider_id,
     )
 
-    # Get all available versions for this engine from the provider
+    # Get all available versions using cached service
     try:
-        all_versions = await kubedb_service.get_versions_by_region(
-            engine=engine.value if hasattr(engine, 'value') else engine,
-            region=region,
-            availability_zone=availability_zone
+        # Use cache service - it will fetch from K8s API only if cache miss
+        # Disable cache in get_available_versions to avoid double caching
+        async def fetch_versions():
+            """Fetch versions from Kubernetes API."""
+            return await kubedb_service.get_available_versions(
+                engine=engine,
+                provider_id=provider_id,
+                kubeconfig_content=provider.kubeconfig_content,
+                use_cache=False,  # Disable internal cache, version_cache_service handles it
+            )
+
+        all_versions = await version_cache_service.get_versions(
+            engine=engine_str,
+            provider_id=provider_id,
+            fetch_fn=fetch_versions,
         )
 
         # Filter to only show versions newer than current version using semantic versioning
@@ -745,7 +911,7 @@ async def get_available_upgrades(
         return {
             "database_id": database_id,
             "current_version": current_version,
-            "engine": engine.value if hasattr(engine, 'value') else engine,
+            "engine": engine_str,
             "available_upgrades": [v.get("version") for v in upgradeable_versions],
             "upgrade_details": upgradeable_versions,
         }
