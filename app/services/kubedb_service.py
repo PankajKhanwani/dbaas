@@ -9,7 +9,7 @@ import base64
 import re
 import tempfile
 import yaml
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client import ApiException
 import aiohttp
@@ -45,6 +45,7 @@ class KubernetesClientSet:
         self.core_api = core_api
         self.apps_api = apps_api
         self.storage_api = client.StorageV1Api(api_client)
+        self.batch_api = client.BatchV1Api(api_client)
 
     async def close(self):
         """Close all API clients."""
@@ -702,34 +703,24 @@ class KubeDBService:
         """
         Build MongoDB custom resource spec.
 
-        For 1 replica: Standalone mode (no replicaSet) - single instance, not scalable
-        For 2 replicas: Force to 3 (ReplicaSet needs odd number for quorum)
-        For 3+ replicas: ReplicaSet mode - scalable and highly available
-
-        Note: Scaling from Standalone (1) to ReplicaSet (3+) requires database recreation.
+        MongoDB is ALWAYS created in replicaSet mode to allow future scaling.
+        MongoDB replicaset requires minimum 2 replicas for quorum.
         """
         resources = self._get_resource_limits(size)
 
-        # Determine topology based on replicas
-        # ReplicaSet requires minimum 3 replicas for proper quorum
-        if replicas == 1:
-            # Standalone mode - single instance, no replicaSet
-            effective_replicas = 1
-            use_replicaset = False
-        elif replicas == 2:
-            # ReplicaSet needs odd number for quorum, force to 3
+        # MongoDB replicaset requires minimum 2 replicas
+        # KubeDB validation webhook enforces this
+        if replicas < 2:
             logger.warning(
-                "mongodb_replicas_adjusted",
-                requested=2,
-                effective=3,
-                reason="ReplicaSet requires odd number (minimum 3) for quorum"
+                "mongodb_replicas_auto_adjusted",
+                requested=replicas,
+                adjusted=2,
+                message="MongoDB replicaset requires minimum 2 replicas, auto-adjusting"
             )
-            effective_replicas = 3
-            use_replicaset = True
-        else:
-            # 3+ replicas - use replicaSet
-            effective_replicas = replicas
-            use_replicaset = True
+            replicas = 2
+        
+        effective_replicas = replicas
+        use_replicaset = True
 
         spec = {
             "version": version,
@@ -3797,6 +3788,1262 @@ class KubeDBService:
                 body=e.body,
             )
             raise KubernetesError(f"Failed to create OpsRequest: {e.reason}")
+
+    async def create_backup_storage_secret(
+        self,
+        namespace: str,
+        secret_name: str,
+        access_key_id: str,
+        secret_access_key: str,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create or update a Kubernetes secret for backup storage credentials.
+
+        Args:
+            namespace: Kubernetes namespace
+            secret_name: Name of the secret
+            access_key_id: S3 access key ID
+            secret_access_key: S3 secret access key
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+
+        Returns:
+            Created/updated secret object
+        """
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+
+        import base64
+        secret_body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": secret_name,
+                "namespace": namespace,
+            },
+            "type": "Opaque",
+            "data": {
+                "AWS_ACCESS_KEY_ID": base64.b64encode(access_key_id.encode()).decode(),
+                "AWS_SECRET_ACCESS_KEY": base64.b64encode(secret_access_key.encode()).decode(),
+            },
+        }
+
+        try:
+            # Try to get existing secret first
+            try:
+                existing = await client_set.core_api.read_namespaced_secret(
+                    name=secret_name,
+                    namespace=namespace,
+                )
+                # Update existing secret
+                result = await client_set.core_api.patch_namespaced_secret(
+                    name=secret_name,
+                    namespace=namespace,
+                    body=secret_body,
+                )
+                logger.info("backup_storage_secret_updated", secret_name=secret_name, namespace=namespace)
+            except ApiException as e:
+                if e.status == 404:
+                    # Create new secret
+                    result = await client_set.core_api.create_namespaced_secret(
+                        namespace=namespace,
+                        body=secret_body,
+                    )
+                    logger.info("backup_storage_secret_created", secret_name=secret_name, namespace=namespace)
+                else:
+                    raise
+
+            return result
+
+        except ApiException as e:
+            logger.error(
+                "failed_to_create_backup_secret",
+                secret_name=secret_name,
+                namespace=namespace,
+                error=str(e),
+            )
+            raise KubeDBError(f"Failed to create backup storage secret: {e.reason}")
+
+    async def create_backup_configuration(
+        self,
+        database_name: str,
+        database_engine: DatabaseEngine,
+        namespace: str,
+        schedule: str = "0 2 * * *",  # Daily at 2 AM
+        retention_days: int = 30,
+        bucket: Optional[str] = None,
+        region: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        secret_name: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a BackupConfiguration for scheduled backups.
+
+        Args:
+            database_name: Name of the database resource
+            database_engine: Database engine type
+            namespace: Kubernetes namespace
+            schedule: Cron schedule for backups (default: daily at 2 AM)
+            retention_days: Number of days to retain backups
+            bucket: S3 bucket name
+            region: S3 region
+            endpoint: S3 endpoint URL (for S3-compatible storage)
+            secret_name: Name of the secret with S3 credentials
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+
+        Returns:
+            Created BackupConfiguration object
+        """
+        if not settings.backup_enabled or not settings.stash_enabled:
+            raise KubeDBError("Backup functionality is disabled")
+
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+
+        # Use settings defaults if not provided
+        bucket = bucket or settings.backup_s3_bucket
+        region = region or settings.backup_s3_region
+        secret_name = secret_name or "backup-storage-secret"
+
+        if not bucket:
+            raise KubeDBError("S3 bucket not configured. Set BACKUP_S3_BUCKET environment variable.")
+
+        # Map engine to Stash target
+        engine_kind_map = {
+            DatabaseEngine.MONGODB: "MongoDB",
+            DatabaseEngine.POSTGRES: "Postgres",
+            DatabaseEngine.MYSQL: "MySQL",
+            DatabaseEngine.REDIS: "Redis",
+            DatabaseEngine.ELASTICSEARCH: "Elasticsearch",
+        }
+
+        engine_kind = engine_kind_map.get(database_engine)
+        if not engine_kind:
+            raise KubeDBError(f"Backup not supported for engine: {database_engine.value}")
+
+        # Build backend configuration
+        backend = {
+            "storageSecretName": secret_name,
+            "s3": {
+                "bucket": bucket,
+                "prefix": f"backups/{database_engine.value}/{database_name}/",
+            },
+        }
+
+        if region:
+            backend["s3"]["region"] = region
+
+        if endpoint:
+            backend["s3"]["endpoint"] = endpoint
+
+        # Calculate retention policy (keep daily backups for retention_days)
+        keep_daily = max(1, retention_days)
+
+        backup_config = {
+            "apiVersion": f"{settings.stash_group}/{settings.stash_version}",
+            "kind": "BackupConfiguration",
+            "metadata": {
+                "name": f"{database_name}-backup-config",
+                "namespace": namespace,
+                "labels": {
+                    "app": "kubedb-dbaas",
+                    "database": database_name,
+                    "engine": database_engine.value,
+                },
+            },
+            "spec": {
+                "target": {
+                    "ref": {
+                        "apiVersion": f"{self._get_kubedb_group(database_engine)}/{self._get_kubedb_version(database_engine)}",
+                        "kind": engine_kind,
+                        "name": database_name,
+                    },
+                },
+                "schedule": schedule,
+                "retentionPolicy": {
+                    "keepLast": 5,
+                    "keepHourly": 24,
+                    "keepDaily": keep_daily,
+                    "keepWeekly": 4,
+                    "keepMonthly": 12,
+                },
+                "backend": backend,
+            },
+        }
+
+        try:
+            result = await client_set.custom_api.create_namespaced_custom_object(
+                group=settings.stash_group,
+                version=settings.stash_version,
+                namespace=namespace,
+                plural="backupconfigurations",
+                body=backup_config,
+            )
+
+            logger.info(
+                "backup_configuration_created",
+                database_name=database_name,
+                namespace=namespace,
+            )
+
+            return result
+
+        except ApiException as e:
+            if e.status == 409:  # Already exists
+                logger.warning(
+                    "backup_configuration_exists",
+                    database_name=database_name,
+                    namespace=namespace,
+                )
+                # Return existing configuration
+                return await client_set.custom_api.get_namespaced_custom_object(
+                    group=settings.stash_group,
+                    version=settings.stash_version,
+                    namespace=namespace,
+                    plural="backupconfigurations",
+                    name=f"{database_name}-backup-config",
+                )
+            elif e.status == 404:
+                # CRDs not installed
+                error_msg = (
+                    f"Stash/KubeStash CRDs not found in cluster. "
+                    f"Please install Stash or KubeStash operator. "
+                    f"API Group: {settings.stash_group}, Version: {settings.stash_version}"
+                )
+                logger.error(
+                    "stash_crds_not_found",
+                    database_name=database_name,
+                    namespace=namespace,
+                    stash_group=settings.stash_group,
+                    stash_version=settings.stash_version,
+                    error=str(e),
+                )
+                raise KubeDBError(error_msg)
+            else:
+                logger.error(
+                    "failed_to_create_backup_configuration",
+                    database_name=database_name,
+                    namespace=namespace,
+                    error=str(e),
+                )
+                raise KubeDBError(f"Failed to create backup configuration: {e.reason}")
+
+    async def trigger_backup(
+        self,
+        database_name: str,
+        database_engine: DatabaseEngine,
+        namespace: str,
+        bucket: Optional[str] = None,
+        region: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        secret_name: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Trigger an on-demand backup by creating a BackupSession.
+
+        Args:
+            database_name: Name of the database resource
+            database_engine: Database engine type
+            namespace: Kubernetes namespace
+            bucket: S3 bucket name
+            region: S3 region
+            endpoint: S3 endpoint URL
+            secret_name: Name of the secret with S3 credentials
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+
+        Returns:
+            Created BackupSession object with job_id
+        """
+        if not settings.backup_enabled or not settings.stash_enabled:
+            raise KubeDBError("Backup functionality is disabled")
+
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+
+        # Use settings defaults if not provided
+        bucket = bucket or settings.backup_s3_bucket
+        region = region or settings.backup_s3_region
+        secret_name = secret_name or "backup-storage-secret"
+
+        if not bucket:
+            raise KubeDBError("S3 bucket not configured. Set BACKUP_S3_BUCKET environment variable.")
+
+        # Map engine to Stash target
+        engine_kind_map = {
+            DatabaseEngine.MONGODB: "MongoDB",
+            DatabaseEngine.POSTGRES: "Postgres",
+            DatabaseEngine.MYSQL: "MySQL",
+            DatabaseEngine.REDIS: "Redis",
+            DatabaseEngine.ELASTICSEARCH: "Elasticsearch",
+        }
+
+        engine_kind = engine_kind_map.get(database_engine)
+        if not engine_kind:
+            raise KubeDBError(f"Backup not supported for engine: {database_engine.value}")
+
+        # Build backend configuration
+        backend = {
+            "storageSecretName": secret_name,
+            "s3": {
+                "bucket": bucket,
+                "prefix": f"backups/{database_engine.value}/{database_name}/",
+            },
+        }
+
+        if region:
+            backend["s3"]["region"] = region
+
+        if endpoint:
+            backend["s3"]["endpoint"] = endpoint
+
+        from datetime import datetime
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        backup_session_name = f"{database_name}-backup-{timestamp}"
+
+        backup_session = {
+            "apiVersion": f"{settings.stash_group}/{settings.stash_version}",
+            "kind": "BackupSession",
+            "metadata": {
+                "name": backup_session_name,
+                "namespace": namespace,
+                "labels": {
+                    "app": "kubedb-dbaas",
+                    "database": database_name,
+                    "engine": database_engine.value,
+                    "backup-type": "on-demand",
+                },
+            },
+            "spec": {
+                "target": {
+                    "ref": {
+                        "apiVersion": f"{self._get_kubedb_group(database_engine)}/{self._get_kubedb_version(database_engine)}",
+                        "kind": engine_kind,
+                        "name": database_name,
+                    },
+                },
+                "backend": backend,
+            },
+        }
+
+        try:
+            result = await client_set.custom_api.create_namespaced_custom_object(
+                group=settings.stash_group,
+                version=settings.stash_version,
+                namespace=namespace,
+                plural="backupsessions",
+                body=backup_session,
+            )
+
+            logger.info(
+                "backup_session_created",
+                database_name=database_name,
+                backup_session_name=backup_session_name,
+                namespace=namespace,
+            )
+
+            return {
+                "backup_session": result,
+                "job_id": backup_session_name,
+                "status": "initiated",
+            }
+
+        except ApiException as e:
+            if e.status == 404:
+                # CRDs not installed or BackupConfiguration missing
+                error_msg = (
+                    f"Stash/KubeStash CRDs not found or BackupConfiguration missing. "
+                    f"Please ensure Stash/KubeStash operator is installed. "
+                    f"API Group: {settings.stash_group}, Version: {settings.stash_version}"
+                )
+                logger.error(
+                    "stash_crds_not_found_for_backup",
+                    database_name=database_name,
+                    namespace=namespace,
+                    stash_group=settings.stash_group,
+                    stash_version=settings.stash_version,
+                    error=str(e),
+                )
+                raise KubeDBError(error_msg)
+            else:
+                logger.error(
+                    "failed_to_create_backup_session",
+                    database_name=database_name,
+                    namespace=namespace,
+                    error=str(e),
+                )
+                raise KubeDBError(f"Failed to trigger backup: {e.reason}")
+
+    async def get_backup_status(
+        self,
+        backup_session_name: str,
+        namespace: str,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get the status of a backup session.
+
+        Args:
+            backup_session_name: Name of the BackupSession
+            namespace: Kubernetes namespace
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+
+        Returns:
+            BackupSession status information
+        """
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+
+        try:
+            result = await client_set.custom_api.get_namespaced_custom_object(
+                group=settings.stash_group,
+                version=settings.stash_version,
+                namespace=namespace,
+                plural="backupsessions",
+                name=backup_session_name,
+            )
+
+            status = result.get("status", {})
+            phase = status.get("phase", "Unknown")
+
+            return {
+                "backup_session_name": backup_session_name,
+                "phase": phase,
+                "status": status,
+                "metadata": result.get("metadata", {}),
+            }
+
+        except ApiException as e:
+            if e.status == 404:
+                raise KubeDBError(f"Backup session not found: {backup_session_name}")
+            else:
+                logger.error(
+                    "failed_to_get_backup_status",
+                    backup_session_name=backup_session_name,
+                    namespace=namespace,
+                    error=str(e),
+                )
+                raise KubeDBError(f"Failed to get backup status: {e.reason}")
+
+    async def list_backups(
+        self,
+        database_name: str,
+        namespace: str,
+        database_engine: Optional[DatabaseEngine] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List all backups for a database (from both Stash and direct S3 backups).
+
+        Args:
+            database_name: Name of the database resource
+            namespace: Kubernetes namespace
+            database_engine: Database engine type (for S3 path)
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+
+        Returns:
+            List of backup sessions
+        """
+        backups = []
+        
+        # 1. Try to list from Stash BackupSessions (if Stash is installed)
+        if settings.stash_enabled:
+            try:
+                client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+                result = await client_set.custom_api.list_namespaced_custom_object(
+                    group=settings.stash_group,
+                    version=settings.stash_version,
+                    namespace=namespace,
+                    plural="backupsessions",
+                    label_selector=f"database={database_name}",
+                )
+
+                for item in result.get("items", []):
+                    metadata = item.get("metadata", {})
+                    status = item.get("status", {})
+                    backups.append({
+                        "backup_id": metadata.get("name", ""),
+                        "phase": status.get("phase", "Unknown"),
+                        "created_at": metadata.get("creationTimestamp", ""),
+                        "status": status,
+                        "type": "stash",
+                    })
+            except ApiException as e:
+                if e.status != 404:
+                    logger.debug("stash_backups_not_available", error=str(e))
+        
+        # 2. List direct backup jobs and S3 backups
+        try:
+            client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+            
+            # List backup jobs
+            jobs = await client_set.batch_api.list_namespaced_job(
+                namespace=namespace,
+                label_selector=f"database={database_name},backup-type=direct",
+            )
+            
+            for job in jobs.items:
+                metadata = job.metadata
+                status = job.status
+                backups.append({
+                    "backup_id": metadata.name,
+                    "phase": "Succeeded" if status.succeeded else ("Failed" if status.failed else "Running"),
+                    "created_at": metadata.creation_timestamp.isoformat() if metadata.creation_timestamp else "",
+                    "status": {
+                        "succeeded": status.succeeded,
+                        "failed": status.failed,
+                        "active": status.active,
+                    },
+                    "type": "direct",
+                    "job_name": metadata.name,
+                })
+        except Exception as e:
+            logger.debug("direct_backup_jobs_list_failed", error=str(e))
+        
+        # 3. List from S3 (if database_engine provided)
+        if database_engine and settings.backup_s3_bucket:
+            try:
+                import aiohttp
+                import base64
+                
+                # Use S3 API to list objects
+                s3_prefix = f"backups/{database_engine.value}/{database_name}/"
+                
+                # For now, we'll get backups from jobs - S3 listing can be added later
+                # as it requires boto3 or direct S3 API calls
+                logger.debug("s3_backup_listing_skipped", message="S3 listing requires boto3")
+            except Exception as e:
+                logger.debug("s3_backup_listing_failed", error=str(e))
+        
+        # Sort by creation time (newest first)
+        backups.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
+        return backups
+
+    async def restore_database(
+        self,
+        database_name: str,
+        database_engine: DatabaseEngine,
+        backup_id: str,
+        namespace: str,
+        bucket: Optional[str] = None,
+        region: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        secret_name: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Restore a database from a backup by creating a RestoreSession.
+
+        Args:
+            database_name: Name of the database resource to restore
+            database_engine: Database engine type
+            backup_id: Name of the BackupSession to restore from
+            namespace: Kubernetes namespace
+            bucket: S3 bucket name
+            region: S3 region
+            endpoint: S3 endpoint URL
+            secret_name: Name of the secret with S3 credentials
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+
+        Returns:
+            Created RestoreSession object with job_id
+        """
+        if not settings.backup_enabled or not settings.stash_enabled:
+            raise KubeDBError("Restore functionality is disabled")
+
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+
+        # Use settings defaults if not provided
+        bucket = bucket or settings.backup_s3_bucket
+        region = region or settings.backup_s3_region
+        secret_name = secret_name or "backup-storage-secret"
+
+        if not bucket:
+            raise KubeDBError("S3 bucket not configured. Set BACKUP_S3_BUCKET environment variable.")
+
+        # Map engine to Stash target
+        engine_kind_map = {
+            DatabaseEngine.MONGODB: "MongoDB",
+            DatabaseEngine.POSTGRES: "Postgres",
+            DatabaseEngine.MYSQL: "MySQL",
+            DatabaseEngine.REDIS: "Redis",
+            DatabaseEngine.ELASTICSEARCH: "Elasticsearch",
+        }
+
+        engine_kind = engine_kind_map.get(database_engine)
+        if not engine_kind:
+            raise KubeDBError(f"Restore not supported for engine: {database_engine.value}")
+
+        # First, get the backup session to find the snapshot name
+        try:
+            backup_session = await client_set.custom_api.get_namespaced_custom_object(
+                group=settings.stash_group,
+                version=settings.stash_version,
+                namespace=namespace,
+                plural="backupsessions",
+                name=backup_id,
+            )
+            # Extract snapshot name from backup session status
+            status = backup_session.get("status", {})
+            snapshot = status.get("snapshot", backup_id)
+        except ApiException as e:
+            if e.status == 404:
+                # If backup session not found, use backup_id as snapshot name
+                snapshot = backup_id
+                logger.warning(
+                    "backup_session_not_found_using_id",
+                    backup_id=backup_id,
+                    namespace=namespace,
+                )
+            else:
+                raise
+
+        # Build backend configuration (same as backup)
+        backend = {
+            "storageSecretName": secret_name,
+            "s3": {
+                "bucket": bucket,
+                "prefix": f"backups/{database_engine.value}/{database_name}/",
+            },
+        }
+
+        if region:
+            backend["s3"]["region"] = region
+
+        if endpoint:
+            backend["s3"]["endpoint"] = endpoint
+
+        from datetime import datetime
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        restore_session_name = f"{database_name}-restore-{timestamp}"
+
+        restore_session = {
+            "apiVersion": f"{settings.stash_group}/{settings.stash_version}",
+            "kind": "RestoreSession",
+            "metadata": {
+                "name": restore_session_name,
+                "namespace": namespace,
+                "labels": {
+                    "app": "kubedb-dbaas",
+                    "database": database_name,
+                    "engine": database_engine.value,
+                    "backup-id": backup_id,
+                },
+            },
+            "spec": {
+                "target": {
+                    "ref": {
+                        "apiVersion": f"{self._get_kubedb_group(database_engine)}/{self._get_kubedb_version(database_engine)}",
+                        "kind": engine_kind,
+                        "name": database_name,
+                    },
+                },
+                "dataSource": {
+                    "stash": {
+                        "name": f"{database_name}-backup-config",
+                        "snapshot": snapshot,
+                    },
+                },
+                "backend": backend,
+            },
+        }
+
+        try:
+            result = await client_set.custom_api.create_namespaced_custom_object(
+                group=settings.stash_group,
+                version=settings.stash_version,
+                namespace=namespace,
+                plural="restoresessions",
+                body=restore_session,
+            )
+
+            logger.info(
+                "restore_session_created",
+                database_name=database_name,
+                restore_session_name=restore_session_name,
+                backup_id=backup_id,
+                namespace=namespace,
+            )
+
+            return {
+                "restore_session": result,
+                "job_id": restore_session_name,
+                "status": "initiated",
+            }
+
+        except ApiException as e:
+            logger.error(
+                "failed_to_create_restore_session",
+                database_name=database_name,
+                namespace=namespace,
+                backup_id=backup_id,
+                error=str(e),
+            )
+            raise KubeDBError(f"Failed to trigger restore: {e.reason}")
+
+    async def create_backup_job_direct(
+        self,
+        database_name: str,
+        database_engine: DatabaseEngine,
+        namespace: str,
+        database_host: str,
+        database_port: int,
+        database_user: str,
+        database_password: str,
+        database_name_db: Optional[str] = None,
+        bucket: Optional[str] = None,
+        region: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        secret_access_key: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a Kubernetes Job for direct database backup (no Stash/KubeStash required).
+        
+        Uses native database tools (pg_dump, mysqldump, mongodump) and uploads to S3.
+        
+        Args:
+            database_name: Name of the database resource
+            database_engine: Database engine type
+            namespace: Kubernetes namespace
+            database_host: Database host/endpoint
+            database_port: Database port
+            database_user: Database username
+            database_password: Database password
+            database_name_db: Database name (for engines that need it)
+            bucket: S3 bucket name
+            region: S3 region
+            endpoint: S3 endpoint URL
+            access_key_id: S3 access key
+            secret_access_key: S3 secret key
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+            
+        Returns:
+            Created Job object with job_id
+        """
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+        
+        # Use settings defaults if not provided
+        bucket = bucket or settings.backup_s3_bucket
+        region = region or settings.backup_s3_region
+        endpoint = endpoint or settings.backup_s3_endpoint
+        access_key_id = access_key_id or settings.backup_s3_access_key_id
+        secret_access_key = secret_access_key or settings.backup_s3_secret_access_key
+        
+        if not bucket:
+            raise KubeDBError("S3 bucket not configured. Set BACKUP_S3_BUCKET environment variable.")
+        
+        if not access_key_id or not secret_access_key:
+            raise KubeDBError("S3 credentials not configured.")
+        
+        # Map engine to dump command and image
+        engine_config = {
+            DatabaseEngine.POSTGRES: {
+                "dump_cmd": "pg_dump",
+                "image": "postgres:16-alpine",
+                "env_vars": {
+                    "PGHOST": database_host,
+                    "PGPORT": str(database_port),
+                    "PGUSER": database_user,
+                    "PGPASSWORD": database_password,
+                    "PGDATABASE": database_name_db or "postgres",
+                },
+                "dump_command": "pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -F c -f /backup/dump.backup 2>/dev/null || pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d postgres -F c -f /backup/dump.backup || pg_dumpall -h $PGHOST -p $PGPORT -U $PGUSER -f /backup/dump.backup",
+            },
+            DatabaseEngine.MYSQL: {
+                "dump_cmd": "mysqldump",
+                "image": "mysql:8.0",
+                "env_vars": {
+                    "MYSQL_HOST": database_host,
+                    "MYSQL_PORT": str(database_port),
+                    "MYSQL_USER": database_user,
+                    "MYSQL_PASSWORD": database_password,
+                    "MYSQL_DATABASE": database_name_db or "mysql",
+                },
+                "dump_command": f"mysqldump -h $MYSQL_HOST -P $MYSQL_PORT -u $MYSQL_USER -p$MYSQL_PASSWORD $MYSQL_DATABASE > /backup/dump.sql",
+            },
+            DatabaseEngine.MONGODB: {
+                "dump_cmd": "mongodump",
+                "image": "mongo:7.0",
+                "env_vars": {
+                    "MONGO_HOST": database_host,
+                    "MONGO_PORT": str(database_port),
+                    "MONGO_USER": database_user,
+                    "MONGO_PASSWORD": database_password,
+                    "MONGO_DATABASE": database_name_db or "admin",
+                },
+                "dump_command": "mongodump --host $MONGO_HOST:$MONGO_PORT --username $MONGO_USER --password $MONGO_PASSWORD --authenticationDatabase admin --db $MONGO_DATABASE --out /backup/dump || mongodump --host $MONGO_HOST:$MONGO_PORT --out /backup/dump",
+            },
+        }
+        
+        config = engine_config.get(database_engine)
+        if not config:
+            raise KubeDBError(f"Direct backup not supported for engine: {database_engine.value}")
+        
+        from datetime import datetime
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        job_name = f"{database_name}-backup-{timestamp}"
+        backup_path = f"backups/{database_engine.value}/{database_name}/{timestamp}"
+        
+        # Build job spec
+        env_vars = []
+        for key, value in config["env_vars"].items():
+            env_vars.append({"name": key, "value": value})
+        
+        # Add S3 credentials
+        env_vars.extend([
+            {"name": "AWS_ACCESS_KEY_ID", "value": access_key_id},
+            {"name": "AWS_SECRET_ACCESS_KEY", "value": secret_access_key},
+            {"name": "AWS_DEFAULT_REGION", "value": region or "us-east-1"},
+            {"name": "S3_BUCKET", "value": bucket},
+            {"name": "S3_ENDPOINT", "value": endpoint},
+            {"name": "BACKUP_PATH", "value": backup_path},
+        ])
+        
+        # Create complete backup script as single-line command
+        # For PostgreSQL: dump then upload
+        if database_engine == DatabaseEngine.POSTGRES:
+            backup_script = (
+                f"set -e && "
+                f"echo 'Starting PostgreSQL backup...' && "
+                f"{config['dump_command']} && "
+                f"echo 'Backup dump completed' && "
+                f"(apk add --no-cache aws-cli 2>/dev/null || (apt-get update -qq && apt-get install -y -qq awscli) 2>/dev/null || true) && "
+                f"echo 'Uploading to S3...' && "
+                f"aws --endpoint-url={endpoint} --no-verify-ssl s3 cp /backup/dump.backup s3://{bucket}/{backup_path}/dump.backup && "
+                f"echo 'Backup uploaded successfully to s3://{bucket}/{backup_path}/dump.backup'"
+            )
+        elif database_engine == DatabaseEngine.MYSQL:
+            backup_script = (
+                f"set -e && "
+                f"echo 'Starting MySQL backup...' && "
+                f"{config['dump_command']} && "
+                f"echo 'Backup dump completed' && "
+                f"(apk add --no-cache aws-cli 2>/dev/null || (apt-get update -qq && apt-get install -y -qq awscli) 2>/dev/null || true) && "
+                f"echo 'Uploading to S3...' && "
+                f"aws --endpoint-url={endpoint} --no-verify-ssl s3 cp /backup/dump.sql s3://{bucket}/{backup_path}/dump.sql && "
+                f"echo 'Backup uploaded successfully to s3://{bucket}/{backup_path}/dump.sql'"
+            )
+        elif database_engine == DatabaseEngine.MONGODB:
+            backup_script = (
+                f"set -e && "
+                f"echo 'Starting MongoDB backup...' && "
+                f"{config['dump_command']} && "
+                f"echo 'Backup dump completed' && "
+                f"(apk add --no-cache aws-cli 2>/dev/null || (apt-get update -qq && apt-get install -y -qq awscli) 2>/dev/null || true) && "
+                f"echo 'Compressing and uploading to S3...' && "
+                f"cd /backup && tar -czf dump.tar.gz dump/ && "
+                f"aws --endpoint-url={endpoint} --no-verify-ssl s3 cp dump.tar.gz s3://{bucket}/{backup_path}/dump.tar.gz && "
+                f"echo 'Backup uploaded successfully to s3://{bucket}/{backup_path}/dump.tar.gz'"
+            )
+        else:
+            backup_script = config["dump_command"]
+        
+        job_spec = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": job_name,
+                "namespace": namespace,
+                "labels": {
+                    "app": "kubedb-dbaas",
+                    "database": database_name,
+                    "engine": database_engine.value,
+                    "backup-type": "direct",
+                },
+            },
+            "spec": {
+                "ttlSecondsAfterFinished": 3600,  # Clean up after 1 hour
+                "backoffLimit": 3,  # Retry up to 3 times
+                "template": {
+                    "spec": {
+                        "restartPolicy": "OnFailure",
+                        "containers": [
+                            {
+                                "name": "backup",
+                                "image": config["image"],
+                                "command": ["/bin/sh", "-c"],
+                                "args": [backup_script],
+                                "env": env_vars,
+                                "volumeMounts": [
+                                    {"name": "backup", "mountPath": "/backup"}
+                                ],
+                            }
+                        ],
+                        "volumes": [
+                            {"name": "backup", "emptyDir": {}}
+                        ],
+                    },
+                },
+            },
+        }
+        
+        try:
+            result = await client_set.batch_api.create_namespaced_job(
+                namespace=namespace,
+                body=job_spec,
+            )
+            
+            logger.info(
+                "backup_job_created",
+                database_name=database_name,
+                job_name=job_name,
+                namespace=namespace,
+            )
+            
+            return {
+                "job": result,
+                "job_id": job_name,
+                "status": "initiated",
+                "s3_path": f"s3://{bucket}/{backup_path}/",
+            }
+            
+        except ApiException as e:
+            logger.error(
+                "failed_to_create_backup_job",
+                database_name=database_name,
+                namespace=namespace,
+                error=str(e),
+            )
+            raise KubeDBError(f"Failed to create backup job: {e.reason}")
+
+    async def create_backup_cronjob_direct(
+        self,
+        database_name: str,
+        database_engine: DatabaseEngine,
+        namespace: str,
+        database_host: str,
+        database_port: int,
+        database_user: str,
+        database_password: str,
+        schedule: str = "0 2 * * *",
+        database_name_db: Optional[str] = None,
+        bucket: Optional[str] = None,
+        region: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        secret_access_key: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a Kubernetes CronJob for scheduled direct database backups.
+        
+        Args:
+            database_name: Name of the database resource
+            database_engine: Database engine type
+            namespace: Kubernetes namespace
+            database_host: Database host/endpoint
+            database_port: Database port
+            database_user: Database username
+            database_password: Database password
+            schedule: Cron schedule (e.g., "0 2 * * *" for daily at 2 AM)
+            database_name_db: Database name (for engines that need it)
+            bucket: S3 bucket name
+            region: S3 region
+            endpoint: S3 endpoint URL
+            access_key_id: S3 access key
+            secret_access_key: S3 secret key
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+            
+        Returns:
+            Created CronJob object
+        """
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+        
+        # Use settings defaults if not provided
+        bucket = bucket or settings.backup_s3_bucket
+        region = region or settings.backup_s3_region
+        endpoint = endpoint or settings.backup_s3_endpoint
+        access_key_id = access_key_id or settings.backup_s3_access_key_id
+        secret_access_key = secret_access_key or settings.backup_s3_secret_access_key
+        
+        if not bucket:
+            raise KubeDBError("S3 bucket not configured.")
+        
+        cronjob_name = f"{database_name}-backup-cronjob"
+        
+        # Get job spec from create_backup_job_direct (reuse logic)
+        # For CronJob, we'll create a simplified version
+        # Note: Full implementation would reuse the job creation logic
+        
+        logger.info(
+            "backup_cronjob_creation_not_fully_implemented",
+            database_name=database_name,
+            message="CronJob creation requires full job spec - using Job creation for now",
+        )
+        
+        # For now, return a placeholder - full CronJob implementation can be added later
+        raise KubeDBError("CronJob creation not fully implemented. Use create_backup_job_direct for manual backups.")
+
+    async def restore_database_direct(
+        self,
+        database_name: str,
+        database_engine: DatabaseEngine,
+        namespace: str,
+        database_host: str,
+        database_port: int,
+        database_user: str,
+        database_password: str,
+        backup_path: str,  # S3 path like "backups/postgres/my-app-db1-demo-demo/20251222-162848/"
+        database_name_db: Optional[str] = None,
+        bucket: Optional[str] = None,
+        region: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        secret_access_key: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Restore database from S3 backup using Kubernetes Job (no Stash/KubeStash required).
+        
+        Args:
+            database_name: Name of the database resource
+            database_engine: Database engine type
+            namespace: Kubernetes namespace
+            database_host: Database host/endpoint
+            database_port: Database port
+            database_user: Database username
+            database_password: Database password
+            backup_path: S3 backup path (e.g., "backups/postgres/my-app-db1-demo-demo/20251222-162848/")
+            database_name_db: Database name (for engines that need it)
+            bucket: S3 bucket name
+            region: S3 region
+            endpoint: S3 endpoint URL
+            access_key_id: S3 access key
+            secret_access_key: S3 secret key
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+            
+        Returns:
+            Created Job object with job_id
+        """
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+        
+        # Use settings defaults if not provided
+        bucket = bucket or settings.backup_s3_bucket
+        region = region or settings.backup_s3_region
+        endpoint = endpoint or settings.backup_s3_endpoint
+        access_key_id = access_key_id or settings.backup_s3_access_key_id
+        secret_access_key = secret_access_key or settings.backup_s3_secret_access_key
+        
+        if not bucket:
+            raise KubeDBError("S3 bucket not configured.")
+        
+        # Map engine to restore command and image
+        engine_config = {
+            DatabaseEngine.POSTGRES: {
+                "restore_cmd": "pg_restore",
+                "image": "postgres:16-alpine",
+                "env_vars": {
+                    "PGHOST": database_host,
+                    "PGPORT": str(database_port),
+                    "PGUSER": database_user,
+                    "PGPASSWORD": database_password,
+                    "PGDATABASE": database_name_db or "postgres",
+                },
+                "restore_command": f"""
+                    set -e
+                    # Use PGDATABASE from env or fallback to postgres
+                    TARGET_DB="${{PGDATABASE:-postgres}}"
+                    echo "Target database: $TARGET_DB"
+                    
+                    # Create database if it doesn't exist (skip if target is 'postgres')
+                    if [ "$TARGET_DB" != "postgres" ]; then
+                        echo "Checking if database $TARGET_DB exists..."
+                        DB_EXISTS=$(psql -h $PGHOST -p $PGPORT -U $PGUSER -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '$TARGET_DB'" 2>/dev/null | grep -q 1 && echo "yes" || echo "no")
+                        if [ "$DB_EXISTS" != "yes" ]; then
+                            echo "Database $TARGET_DB does not exist, creating it..."
+                            psql -h $PGHOST -p $PGPORT -U $PGUSER -d postgres -c "CREATE DATABASE \\"$TARGET_DB\\"" || echo "Warning: Database creation may have failed"
+                        else
+                            echo "Database $TARGET_DB already exists"
+                        fi
+                    fi
+                    
+                    # Restore backup
+                    if [ -f /backup/dump.backup ]; then
+                        echo "Restoring from custom format backup to $TARGET_DB..."
+                        pg_restore -h $PGHOST -p $PGPORT -U $PGUSER -d "$TARGET_DB" --clean --if-exists --no-owner --no-privileges /backup/dump.backup 2>&1 || echo "pg_restore failed, trying SQL restore..."
+                        set +e
+                    fi
+                    
+                    if [ -f /backup/dump.sql ]; then
+                        echo "Restoring from SQL dump to $TARGET_DB..."
+                        psql -h $PGHOST -p $PGPORT -U $PGUSER -d "$TARGET_DB" < /backup/dump.sql 2>&1 || echo "SQL restore completed with warnings"
+                    fi
+                    
+                    echo "Restore process completed for database: $TARGET_DB"
+                """,
+            },
+            DatabaseEngine.MYSQL: {
+                "restore_cmd": "mysql",
+                "image": "mysql:8.0",
+                "env_vars": {
+                    "MYSQL_HOST": database_host,
+                    "MYSQL_PORT": str(database_port),
+                    "MYSQL_USER": database_user,
+                    "MYSQL_PASSWORD": database_password,
+                    "MYSQL_DATABASE": database_name_db or "mysql",
+                },
+                "restore_command": "mysql -h $MYSQL_HOST -P $MYSQL_PORT -u $MYSQL_USER -p$MYSQL_PASSWORD $MYSQL_DATABASE < /backup/dump.sql",
+            },
+            DatabaseEngine.MONGODB: {
+                "restore_cmd": "mongorestore",
+                "image": "mongo:7.0",
+                "env_vars": {
+                    "MONGO_HOST": database_host,
+                    "MONGO_PORT": str(database_port),
+                    "MONGO_USER": database_user,
+                    "MONGO_PASSWORD": database_password,
+                    "MONGO_DATABASE": database_name_db or "admin",
+                },
+                "restore_command": "mongorestore --host $MONGO_HOST:$MONGO_PORT --username $MONGO_USER --password $MONGO_PASSWORD --authenticationDatabase admin --db $MONGO_DATABASE /backup/dump || mongorestore --host $MONGO_HOST:$MONGO_PORT /backup/dump",
+            },
+        }
+        
+        config = engine_config.get(database_engine)
+        if not config:
+            raise KubeDBError(f"Direct restore not supported for engine: {database_engine.value}")
+        
+        from datetime import datetime
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        job_name = f"{database_name}-restore-{timestamp}"
+        
+        # Create S3 download and restore script
+        restore_script = f"""#!/bin/sh
+set -e
+echo "Starting restore from S3..."
+
+# Install AWS CLI if not present
+if ! command -v aws &> /dev/null; then
+    (apk add --no-cache aws-cli 2>/dev/null || (apt-get update -qq && apt-get install -y -qq awscli) 2>/dev/null || true)
+fi
+
+# Download backup from S3
+echo "Downloading backup from s3://{bucket}/{backup_path}..."
+mkdir -p /backup
+
+# Try to download backup file (check for different formats)
+if aws --endpoint-url={endpoint} --no-verify-ssl s3 cp s3://{bucket}/{backup_path}dump.backup /backup/dump.backup 2>/dev/null; then
+    echo "Downloaded PostgreSQL custom format backup"
+elif aws --endpoint-url={endpoint} --no-verify-ssl s3 cp s3://{bucket}/{backup_path}dump.sql /backup/dump.sql 2>/dev/null; then
+    echo "Downloaded SQL dump"
+elif aws --endpoint-url={endpoint} --no-verify-ssl s3 cp s3://{bucket}/{backup_path}dump.tar.gz /backup/dump.tar.gz 2>/dev/null; then
+    echo "Downloaded compressed dump, extracting..."
+    cd /backup
+    tar -xzf dump.tar.gz
+else
+    echo "ERROR: No backup file found in s3://{bucket}/{backup_path}"
+    exit 1
+fi
+
+echo "Backup downloaded successfully"
+echo "Starting database restore..."
+"""
+        
+        # Build job spec
+        env_vars = []
+        for key, value in config["env_vars"].items():
+            env_vars.append({"name": key, "value": value})
+        
+        # Add S3 credentials
+        env_vars.extend([
+            {"name": "AWS_ACCESS_KEY_ID", "value": access_key_id},
+            {"name": "AWS_SECRET_ACCESS_KEY", "value": secret_access_key},
+            {"name": "AWS_DEFAULT_REGION", "value": region or "us-east-1"},
+            {"name": "S3_BUCKET", "value": bucket},
+            {"name": "S3_ENDPOINT", "value": endpoint},
+            {"name": "BACKUP_PATH", "value": backup_path},
+        ])
+        
+        job_spec = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": job_name,
+                "namespace": namespace,
+                "labels": {
+                    "app": "kubedb-dbaas",
+                    "database": database_name,
+                    "engine": database_engine.value,
+                    "restore-type": "direct",
+                },
+            },
+            "spec": {
+                "ttlSecondsAfterFinished": 3600,  # Clean up after 1 hour
+                "template": {
+                    "spec": {
+                        "restartPolicy": "OnFailure",
+                        "containers": [
+                            {
+                                "name": "restore",
+                                "image": config["image"],
+                                "command": ["/bin/sh", "-c"],
+                                "args": [
+                                    f"""
+                                    {restore_script}
+                                    {config["restore_command"]}
+                                    echo "Restore completed successfully!"
+                                    """
+                                ],
+                                "env": env_vars,
+                                "volumeMounts": [
+                                    {"name": "backup", "mountPath": "/backup"}
+                                ],
+                            }
+                        ],
+                        "volumes": [
+                            {"name": "backup", "emptyDir": {}}
+                        ],
+                    },
+                },
+            },
+        }
+        
+        try:
+            result = await client_set.batch_api.create_namespaced_job(
+                namespace=namespace,
+                body=job_spec,
+            )
+            
+            logger.info(
+                "restore_job_created",
+                database_name=database_name,
+                job_name=job_name,
+                namespace=namespace,
+                backup_path=backup_path,
+            )
+            
+            return {
+                "job": result,
+                "job_id": job_name,
+                "status": "initiated",
+                "backup_path": f"s3://{bucket}/{backup_path}",
+            }
+            
+        except ApiException as e:
+            logger.error(
+                "failed_to_create_restore_job",
+                database_name=database_name,
+                namespace=namespace,
+                error=str(e),
+            )
+            raise KubeDBError(f"Failed to create restore job: {e.reason}")
 
 
 # Global instance

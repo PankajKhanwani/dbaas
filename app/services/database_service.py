@@ -6,6 +6,8 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
+from kubernetes_asyncio.client.exceptions import ApiException
+
 from app.config.logging import get_logger
 from app.config.settings import settings
 from app.exceptions import (
@@ -151,7 +153,19 @@ class DatabaseService:
                 f"Region: {headers.get('x-region', 'any')}, AZ: {headers.get('x-availability-zone', 'any')}"
             )
 
-        # PRE-CHECK 4: Generate Kubernetes-compliant resource name
+        # PRE-CHECK 4: Validate replicas based on engine
+        # MongoDB replicaset requires minimum 2 replicas for quorum
+        validated_replicas = db_request.replicas
+        if db_request.engine == DatabaseEngine.MONGODB and db_request.replicas < 2:
+            logger.warning(
+                "mongodb_replicas_validation",
+                requested=db_request.replicas,
+                adjusted=2,
+                message="MongoDB replicaset requires minimum 2 replicas, auto-adjusting"
+            )
+            validated_replicas = 2
+
+        # PRE-CHECK 5: Generate Kubernetes-compliant resource name
         kubedb_name = f"{db_request.name}-{domain}-{project}".lower()
         kubedb_name = kubedb_name[:63].rstrip('-')
 
@@ -164,7 +178,7 @@ class DatabaseService:
             version=db_request.version,
             size=db_request.size,
             storage_gb=db_request.storage_gb,
-            replicas=db_request.replicas,
+            replicas=validated_replicas,
             status=DatabaseStatus.PENDING,  # Will be updated by reconciler
             backup_enabled=db_request.backup_enabled,
             backup_schedule=db_request.backup_schedule,
@@ -435,6 +449,118 @@ class DatabaseService:
                         db.port = endpoint_info.get("port")
 
                     await db.save()
+
+                    # Trigger initial backup if backup is enabled (using direct backup method)
+                    if db.backup_enabled and settings.backup_enabled:
+                        try:
+                            # Get database credentials for backup
+                            try:
+                                db_credentials_obj = await self.get_credentials(db.id, db.domain, db.project)
+                                db_credentials = {
+                                    "username": db_credentials_obj.username,
+                                    "password": db_credentials_obj.password,
+                                    "database": db_credentials_obj.database or ("postgres" if db.engine.value == "postgres" else db.name),
+                                }
+                            except Exception as cred_error:
+                                logger.warning(
+                                    "failed_to_get_credentials_for_initial_backup",
+                                    database_id=db.id,
+                                    error=str(cred_error),
+                                )
+                                # Use default credentials - for PostgreSQL, use "postgres" as default database
+                                default_db = "postgres" if db.engine.value == "postgres" else (db.name if db.engine.value == "mysql" else "admin")
+                                db_credentials = {
+                                    "username": "postgres" if db.engine.value == "postgres" else "root",
+                                    "password": "",
+                                    "database": default_db,
+                                }
+                            
+                            # Trigger direct backup job
+                            # For PostgreSQL, use "postgres" database for backup (pg_dumpall will backup all databases)
+                            backup_db_name = "postgres" if db.engine.value == "postgres" else db_credentials.get("database", db.name)
+                            
+                            await kubedb_service.create_backup_job_direct(
+                                database_name=db.kubedb_resource_name,
+                                database_engine=db.engine,
+                                namespace=db.namespace,
+                                database_host=db.endpoint or "localhost",
+                                database_port=db.port or 5432,
+                                database_user=db_credentials.get("username", "postgres"),
+                                database_password=db_credentials.get("password", ""),
+                                database_name_db=backup_db_name,
+                                bucket=settings.backup_s3_bucket,
+                                region=settings.backup_s3_region,
+                                endpoint=settings.backup_s3_endpoint,
+                                access_key_id=settings.backup_s3_access_key_id,
+                                secret_access_key=settings.backup_s3_secret_access_key,
+                                provider_id=provider_id,
+                                kubeconfig_content=kubeconfig_content,
+                            )
+
+                            logger.info(
+                                "initial_backup_triggered",
+                                database_id=db.id,
+                                database_name=db.kubedb_resource_name,
+                            )
+                        except Exception as backup_error:
+                            # Don't fail database creation if backup fails
+                            logger.warning(
+                                "initial_backup_failed",
+                                database_id=db.id,
+                                error=str(backup_error),
+                            )
+                    
+                    # Also try to create Stash backup configuration if Stash is enabled (for backward compatibility)
+                    if db.backup_enabled and settings.backup_enabled and settings.stash_enabled:
+                        try:
+                            # Ensure backup storage secret exists
+                            if settings.backup_s3_access_key_id and settings.backup_s3_secret_access_key:
+                                await kubedb_service.create_backup_storage_secret(
+                                    namespace=db.namespace,
+                                    secret_name="backup-storage-secret",
+                                    access_key_id=settings.backup_s3_access_key_id,
+                                    secret_access_key=settings.backup_s3_secret_access_key,
+                                    provider_id=provider_id,
+                                    kubeconfig_content=kubeconfig_content,
+                                )
+
+                            # Map backup schedule to cron format
+                            schedule_map = {
+                                "hourly": "0 * * * *",
+                                "daily": "0 2 * * *",
+                                "weekly": "0 2 * * 0",
+                            }
+                            cron_schedule = schedule_map.get(
+                                db.backup_schedule.value if db.backup_schedule else "daily",
+                                "0 2 * * *"
+                            )
+
+                            # Create backup configuration
+                            await kubedb_service.create_backup_configuration(
+                                database_name=db.kubedb_resource_name,
+                                database_engine=db.engine,
+                                namespace=db.namespace,
+                                schedule=cron_schedule,
+                                retention_days=db.backup_retention_days,
+                                bucket=settings.backup_s3_bucket,
+                                region=settings.backup_s3_region,
+                                endpoint=settings.backup_s3_endpoint,
+                                provider_id=provider_id,
+                                kubeconfig_content=kubeconfig_content,
+                            )
+
+                            logger.info(
+                                "stash_backup_configuration_created",
+                                database_id=db.id,
+                                schedule=cron_schedule,
+                            )
+                        except Exception as backup_error:
+                            # Don't fail database creation if backup config fails
+                            logger.warning(
+                                "stash_backup_configuration_failed",
+                                database_id=db.id,
+                                error=str(backup_error),
+                            )
 
                     logger.info(
                         "database_ready",
@@ -1519,6 +1645,548 @@ class DatabaseService:
                 database_id=database_id,
             )
             return False
+
+    async def trigger_backup(
+        self,
+        database_id: str,
+        domain: str,
+        project: str,
+    ) -> Dict[str, Any]:
+        """
+        Trigger an on-demand backup for a database.
+
+        Args:
+            database_id: Database ID
+            domain: Domain name
+            project: Project name
+
+        Returns:
+            Backup job information with job_id
+        """
+        db = await Database.find_one(
+            Database.id == database_id,
+            Database.domain == domain,
+            Database.project == project,
+        )
+
+        if not db:
+            raise NotFoundError(f"Database {database_id} not found")
+
+        if not db.kubedb_resource_name:
+            raise DatabaseOperationError(
+                operation="trigger_backup",
+                database_id=database_id,
+                reason="Database resource name not found. Cannot trigger backup."
+            )
+
+        # Get provider kubeconfig for multi-cluster support
+        provider_id, kubeconfig_content = await self._get_provider_kubeconfig(db)
+
+        # Get database credentials from secret
+        try:
+            db_credentials_obj = await self.get_credentials(db.id, domain, project)
+            db_credentials = {
+                "username": db_credentials_obj.username,
+                "password": db_credentials_obj.password,
+                "database": db_credentials_obj.database or db.name,
+            }
+        except Exception as cred_error:
+            logger.warning(
+                "failed_to_get_credentials_for_backup",
+                database_id=db.id,
+                error=str(cred_error),
+            )
+            # Use default credentials (KubeDB creates default secrets)
+            db_credentials = {
+                "username": "postgres" if db.engine.value == "postgres" else "root",
+                "password": "",  # Will be read from secret in the job
+                "database": db.name,
+            }
+
+        # Use direct backup (Kubernetes Job) - no Stash/KubeStash required
+        try:
+            result = await kubedb_service.create_backup_job_direct(
+                database_name=db.kubedb_resource_name,
+                database_engine=db.engine,
+                namespace=db.namespace,
+                database_host=db.endpoint or "localhost",
+                database_port=db.port or 5432,
+                database_user=db_credentials.get("username", "postgres"),
+                database_password=db_credentials.get("password", ""),
+                database_name_db=db_credentials.get("database", db.name),
+                bucket=settings.backup_s3_bucket,
+                region=settings.backup_s3_region,
+                endpoint=settings.backup_s3_endpoint,
+                access_key_id=settings.backup_s3_access_key_id,
+                secret_access_key=settings.backup_s3_secret_access_key,
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+            )
+            
+            logger.info(
+                "direct_backup_job_created",
+                database_id=db.id,
+                job_id=result.get("job_id"),
+            )
+            
+        except Exception as backup_error:
+            # Fallback to Stash if direct backup fails (for backward compatibility)
+            logger.warning(
+                "direct_backup_failed_trying_stash",
+                database_id=db.id,
+                error=str(backup_error),
+            )
+            
+            # Try Stash backup as fallback
+            try:
+                result = await kubedb_service.trigger_backup(
+                    database_name=db.kubedb_resource_name,
+                    database_engine=db.engine,
+                    namespace=db.namespace,
+                    bucket=settings.backup_s3_bucket,
+                    region=settings.backup_s3_region,
+                    endpoint=settings.backup_s3_endpoint,
+                    provider_id=provider_id,
+                    kubeconfig_content=kubeconfig_content,
+                )
+            except Exception as stash_error:
+                logger.error(
+                    "both_backup_methods_failed",
+                    database_id=db.id,
+                    direct_error=str(backup_error),
+                    stash_error=str(stash_error),
+                )
+                raise DatabaseOperationError(
+                    operation="trigger_backup",
+                    database_id=database_id,
+                    reason=f"Direct backup error: {backup_error}. Stash backup error: {stash_error}"
+                )
+
+        # Log audit event
+        await audit_service.log_action(
+            action="backup",
+            resource_type="database",
+            resource_id=database_id,
+            domain=domain,
+            project=project,
+            details={"job_id": result.get("job_id")},
+        )
+
+        return {
+            "message": "Backup initiated",
+            "database_id": database_id,
+            "domain": domain,
+            "project": project,
+            "job_id": result.get("job_id"),
+            "status": result.get("status"),
+        }
+
+    async def list_backups(
+        self,
+        database_id: str,
+        domain: str,
+        project: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        List all backups for a database.
+
+        Args:
+            database_id: Database ID
+            domain: Domain name
+            project: Project name
+
+        Returns:
+            List of backup sessions
+        """
+        db = await Database.find_one(
+            Database.id == database_id,
+            Database.domain == domain,
+            Database.project == project,
+        )
+
+        if not db:
+            raise NotFoundError(f"Database {database_id} not found")
+
+        if not db.kubedb_resource_name:
+            raise DatabaseOperationError(
+                operation="list_backups",
+                database_id=database_id,
+                reason="Database resource name not found. Cannot list backups."
+            )
+
+        # Get provider kubeconfig for multi-cluster support
+        provider_id, kubeconfig_content = await self._get_provider_kubeconfig(db)
+
+        # List backups (include database_engine for S3 listing)
+        backups = await kubedb_service.list_backups(
+            database_name=db.kubedb_resource_name,
+            namespace=db.namespace,
+            database_engine=db.engine,
+            provider_id=provider_id,
+            kubeconfig_content=kubeconfig_content,
+        )
+
+        return backups
+
+    async def restore_database(
+        self,
+        database_id: str,
+        backup_id: str,
+        domain: str,
+        project: str,
+        restore_mode: str = "override",
+    ) -> Dict[str, Any]:
+        """
+        Restore a database from a backup.
+
+        Args:
+            database_id: Database ID
+            backup_id: Backup session ID to restore from
+            domain: Domain name
+            project: Project name
+            restore_mode: "override" (restore to existing DB) or "recreate" (delete and create new)
+
+        Returns:
+            Restore job information with job_id
+        """
+        db = await Database.find_one(
+            Database.id == database_id,
+            Database.domain == domain,
+            Database.project == project,
+        )
+
+        if not db:
+            raise NotFoundError(f"Database {database_id} not found")
+        
+        # If recreate mode, delete and create new database
+        if restore_mode == "recreate":
+            logger.info(
+                "restore_mode_recreate",
+                database_id=database_id,
+                backup_id=backup_id,
+                message="Deleting existing database and creating new one for restore"
+            )
+            
+            # Save database configuration for recreation
+            db_config = {
+                "name": db.name,
+                "engine": db.engine,
+                "version": db.version,
+                "size": db.size,
+                "storage_gb": db.storage_gb,
+                "replicas": db.replicas,
+                "backup_enabled": db.backup_enabled,
+                "backup_schedule": db.backup_schedule,
+                "backup_retention_days": db.backup_retention_days,
+                "high_availability": db.high_availability,
+                "monitoring_enabled": db.monitoring_enabled,
+                "region": db.region,
+                "availability_zone": db.availability_zone,
+                "provider_id": db.provider_id,
+                "namespace": db.namespace,
+            }
+            
+            # Get provider kubeconfig before deletion
+            provider_id, kubeconfig_content = await self._get_provider_kubeconfig(db)
+            
+            # Delete existing database
+            logger.info("deleting_database_for_recreate", database_id=database_id)
+            deleted = await kubedb_service.delete_database(
+                engine=db.engine,
+                name=db.kubedb_resource_name,
+                namespace=db.namespace,
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+            )
+            
+            if not deleted:
+                raise DatabaseOperationError(
+                    operation="restore",
+                    database_id=database_id,
+                    reason="Failed to delete existing database for recreate mode"
+                )
+            
+            # Wait for deletion to complete (poll for status)
+            import asyncio
+            max_wait = 60  # 60 seconds max wait
+            wait_interval = 2  # Check every 2 seconds
+            waited = 0
+            
+            while waited < max_wait:
+                try:
+                    # Check if KubeDB resource still exists
+                    client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                    try:
+                        await client_set.custom_api.get_namespaced_custom_object(
+                            group=kubedb_service._get_kubedb_group(db.engine),
+                            version=kubedb_service._get_kubedb_version(db.engine),
+                            namespace=db.namespace,
+                            plural=kubedb_service._get_kubedb_plural(db.engine),
+                            name=db.kubedb_resource_name,
+                        )
+                        # Still exists, wait more
+                        logger.debug("waiting_for_database_deletion", waited=waited)
+                        await asyncio.sleep(wait_interval)
+                        waited += wait_interval
+                    except ApiException as e:
+                        if e.status == 404:
+                            # Resource deleted, proceed
+                            logger.info("database_deleted_for_recreate", waited=waited)
+                            break
+                        else:
+                            raise
+                except Exception as e:
+                    logger.warning("error_checking_deletion_status", error=str(e))
+                    await asyncio.sleep(wait_interval)
+                    waited += wait_interval
+            
+            if waited >= max_wait:
+                logger.warning("database_deletion_timeout", waited=waited)
+                # Continue anyway, might be deleted
+            
+            # Delete database record from MongoDB
+            await db.delete()
+            logger.info("database_record_deleted_for_recreate", database_id=database_id)
+            
+            # Create new database with same configuration
+            logger.info("creating_new_database_for_restore", config=db_config)
+            
+            from app.models.database import DatabaseCreateRequest
+            create_request = DatabaseCreateRequest(
+                name=db_config["name"],
+                engine=db_config["engine"],
+                version=db_config["version"],
+                size=db_config["size"],
+                storage_gb=db_config["storage_gb"],
+                replicas=db_config["replicas"],
+                backup_enabled=db_config["backup_enabled"],
+                backup_schedule=db_config.get("backup_schedule", "daily"),
+                backup_retention_days=db_config.get("backup_retention_days", 30),
+                high_availability=db_config.get("high_availability", False),
+                monitoring_enabled=db_config.get("monitoring_enabled", True),
+                region=db_config.get("region"),
+                availability_zone=db_config.get("availability_zone"),
+            )
+            
+            # Create the new database
+            new_db_response = await self.create_database(
+                request=create_request,
+                domain=domain,
+                project=project,
+            )
+            
+            new_database_id = new_db_response.id
+            logger.info(
+                "new_database_created_for_restore",
+                old_database_id=database_id,
+                new_database_id=new_database_id,
+            )
+            
+            # Wait for database to be running before restoring
+            logger.info("waiting_for_new_database_to_be_ready", database_id=new_database_id)
+            max_wait_ready = 300  # 5 minutes
+            wait_interval_ready = 5  # Check every 5 seconds
+            waited_ready = 0
+            
+            while waited_ready < max_wait_ready:
+                new_db = await Database.find_one(Database.id == new_database_id)
+                if new_db and new_db.status == DatabaseStatus.RUNNING and new_db.endpoint:
+                    logger.info("new_database_ready_for_restore", database_id=new_database_id, waited=waited_ready)
+                    break
+                await asyncio.sleep(wait_interval_ready)
+                waited_ready += wait_interval_ready
+            
+            if waited_ready >= max_wait_ready:
+                raise DatabaseOperationError(
+                    operation="restore",
+                    database_id=new_database_id,
+                    reason="New database did not become ready in time for restore"
+                )
+            
+            # Update database_id to new database for restore
+            database_id = new_database_id
+            db = await Database.find_one(Database.id == database_id)
+            
+            if not db:
+                raise NotFoundError(f"New database {database_id} not found after creation")
+
+        if not db.kubedb_resource_name:
+            raise DatabaseOperationError(
+                operation="restore",
+                database_id=database_id,
+                reason="Database resource name not found. Cannot restore."
+            )
+
+        # Get provider kubeconfig for multi-cluster support
+        provider_id, kubeconfig_content = await self._get_provider_kubeconfig(db)
+
+        # Ensure backup storage secret exists
+        if settings.backup_s3_access_key_id and settings.backup_s3_secret_access_key:
+            await kubedb_service.create_backup_storage_secret(
+                namespace=db.namespace,
+                secret_name="backup-storage-secret",
+                access_key_id=settings.backup_s3_access_key_id,
+                secret_access_key=settings.backup_s3_secret_access_key,
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+            )
+
+        # Get database credentials for restore
+        try:
+            db_credentials_obj = await self.get_credentials(db.id, domain, project)
+            db_credentials = {
+                "username": db_credentials_obj.username,
+                "password": db_credentials_obj.password,
+                "database": db_credentials_obj.database or db.name,
+            }
+        except Exception as cred_error:
+            logger.warning(
+                "failed_to_get_credentials_for_restore",
+                database_id=db.id,
+                error=str(cred_error),
+            )
+            db_credentials = {
+                "username": "postgres" if db.engine.value == "postgres" else "root",
+                "password": "",
+                "database": db.name,
+            }
+        
+        # Extract backup path from backup_id
+        # backup_id can be:
+        # 1. Job name: "my-app-db1-demo-demo-backup-20251222-162848"
+        # 2. S3 path: "backups/postgres/my-app-db1-demo-demo/20251222-162848/"
+        # 3. Just timestamp: "20251222-162848"
+        
+        backup_path = backup_id
+        if not backup_path.startswith("backups/"):
+            # If it's a job name or timestamp, construct the path
+            if "backup-" in backup_path:
+                # Extract timestamp from job name
+                timestamp = backup_path.split("backup-")[-1]
+            else:
+                timestamp = backup_path
+            backup_path = f"backups/{db.engine.value}/{db.kubedb_resource_name}/{timestamp}/"
+        
+        # Use direct restore (Kubernetes Job) - no Stash/KubeStash required
+        try:
+            result = await kubedb_service.restore_database_direct(
+                database_name=db.kubedb_resource_name,
+                database_engine=db.engine,
+                namespace=db.namespace,
+                database_host=db.endpoint or "localhost",
+                database_port=db.port or 5432,
+                database_user=db_credentials.get("username", "postgres"),
+                database_password=db_credentials.get("password", ""),
+                backup_path=backup_path,
+                database_name_db=db_credentials.get("database", db.name),
+                bucket=settings.backup_s3_bucket,
+                region=settings.backup_s3_region,
+                endpoint=settings.backup_s3_endpoint,
+                access_key_id=settings.backup_s3_access_key_id,
+                secret_access_key=settings.backup_s3_secret_access_key,
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+            )
+            
+            logger.info(
+                "direct_restore_job_created",
+                database_id=db.id,
+                job_id=result.get("job_id"),
+            )
+            
+        except Exception as restore_error:
+            # Fallback to Stash if direct restore fails
+            logger.warning(
+                "direct_restore_failed_trying_stash",
+                database_id=db.id,
+                error=str(restore_error),
+            )
+            
+            try:
+                result = await kubedb_service.restore_database(
+                    database_name=db.kubedb_resource_name,
+                    database_engine=db.engine,
+                    backup_id=backup_id,
+                    namespace=db.namespace,
+                    bucket=settings.backup_s3_bucket,
+                    region=settings.backup_s3_region,
+                    endpoint=settings.backup_s3_endpoint,
+                    provider_id=provider_id,
+                    kubeconfig_content=kubeconfig_content,
+                )
+            except Exception as stash_error:
+                logger.error(
+                    "both_restore_methods_failed",
+                    database_id=db.id,
+                    direct_error=str(restore_error),
+                    stash_error=str(stash_error),
+                )
+                raise DatabaseOperationError(
+                    operation="restore",
+                    database_id=database_id,
+                    reason=f"Direct restore error: {restore_error}. Stash restore error: {stash_error}"
+                )
+
+        # Log audit event
+        await audit_service.log_action(
+            action="restore",
+            resource_type="database",
+            resource_id=database_id,
+            domain=domain,
+            project=project,
+            details={"backup_id": backup_id, "job_id": result.get("job_id")},
+        )
+
+        return {
+            "message": "Restore initiated",
+            "database_id": database_id,
+            "domain": domain,
+            "project": project,
+            "backup_id": backup_id,
+            "job_id": result.get("job_id"),
+            "status": result.get("status"),
+        }
+
+    async def get_backup_status(
+        self,
+        database_id: str,
+        backup_job_id: str,
+        domain: str,
+        project: str,
+    ) -> Dict[str, Any]:
+        """
+        Get the status of a backup job.
+
+        Args:
+            database_id: Database ID
+            backup_job_id: Backup session name/job ID
+            domain: Domain name
+            project: Project name
+
+        Returns:
+            Backup status information
+        """
+        db = await Database.find_one(
+            Database.id == database_id,
+            Database.domain == domain,
+            Database.project == project,
+        )
+
+        if not db:
+            raise NotFoundError(f"Database {database_id} not found")
+
+        # Get provider kubeconfig for multi-cluster support
+        provider_id, kubeconfig_content = await self._get_provider_kubeconfig(db)
+
+        # Get backup status
+        status = await kubedb_service.get_backup_status(
+            backup_session_name=backup_job_id,
+            namespace=db.namespace,
+            provider_id=provider_id,
+            kubeconfig_content=kubeconfig_content,
+        )
+
+        return status
 
 
 # Global instance

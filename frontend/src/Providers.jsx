@@ -37,13 +37,25 @@ function Providers({ showNotification }) {
 
   const fetchProviders = async () => {
     try {
+      console.log('Fetching providers from:', `${API_BASE}/providers/`)
       const response = await fetch(`${API_BASE}/providers/`)
+      console.log('Response status:', response.status, response.statusText)
+      
+      if (!response.ok) {
+        const errorText = await response.text()
+        console.error('Error response:', errorText)
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+      }
+      
       const data = await response.json()
+      console.log('Providers data received:', data)
+      console.log('Providers array:', data.providers)
       setProviders(data.providers || [])
       setLoading(false)
     } catch (error) {
+      console.error('Error fetching providers:', error)
       setLoading(false)
-      showNotification('Failed to fetch providers', 'error')
+      showNotification(`Failed to fetch providers: ${error.message}`, 'error')
     }
   }
 
@@ -98,15 +110,29 @@ function Providers({ showNotification }) {
       })
 
       if (!response.ok) {
-        const error = await response.json()
-        throw new Error(error.error?.message || 'Failed to create provider')
+        let errorMessage = 'Failed to create provider'
+        try {
+          const error = await response.json()
+          errorMessage = error.error?.message || error.message || errorMessage
+          // Add more details if available
+          if (error.error?.details) {
+            const details = typeof error.error.details === 'string' 
+              ? error.error.details 
+              : JSON.stringify(error.error.details)
+            errorMessage += `: ${details}`
+          }
+        } catch (e) {
+          errorMessage = `HTTP ${response.status}: ${response.statusText}`
+        }
+        throw new Error(errorMessage)
       }
 
       showNotification('Provider created successfully!', 'success')
       closeModal()
       fetchProviders()
     } catch (error) {
-      showNotification(error.message, 'error')
+      console.error('Provider creation error:', error)
+      showNotification(error.message || 'Failed to create provider', 'error')
     }
   }
 
@@ -214,6 +240,7 @@ function Providers({ showNotification }) {
       <div className="loading">
         <div className="spinner"></div>
         <p>Loading providers...</p>
+        <p style={{fontSize: '0.8rem', marginTop: '1rem'}}>Check browser console (F12) for details</p>
       </div>
     )
   }
@@ -233,11 +260,19 @@ function Providers({ showNotification }) {
 
       {/* Content */}
       <div className="content-area">
+        {/* Debug info */}
+        <div style={{padding: '0.5rem', background: '#f3f4f6', marginBottom: '1rem', fontSize: '0.8rem'}}>
+          <strong>Debug:</strong> Providers count: {providers.length} | Loading: {loading ? 'Yes' : 'No'}
+        </div>
+        
         {providers.length === 0 ? (
           <div className="empty-state">
             <div className="empty-icon">📦</div>
             <h3>No providers configured</h3>
             <p>Get started by adding your first Kubernetes cluster</p>
+            <p style={{fontSize: '0.8rem', color: '#666', marginTop: '0.5rem'}}>
+              Check browser console (F12) for API response details
+            </p>
             <button className="btn-primary" onClick={() => { resetForm(); setShowCreateModal(true) }}>
               + New Provider
             </button>

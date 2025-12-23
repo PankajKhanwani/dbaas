@@ -748,17 +748,39 @@ async def trigger_backup(
     Trigger an immediate backup.
 
     Creates a snapshot of the database that can be used for restore.
-    Backup is performed asynchronously.
+    Backup is performed asynchronously using KubeDB Stash.
 
     Returns a job ID to track backup progress.
     """
-    # TODO: Implement backup via KubeDB Stash
-    result = {
-        "message": "Backup initiated",
+    return await database_service.trigger_backup(
+        database_id=database_id,
+        domain=domain_name,
+        project=project_name,
+    )
+
+
+@router.get("/{database_id}/backups", status_code=status.HTTP_200_OK)
+async def list_backups(
+    domain_name: str = Path(..., description="Domain name"),
+    project_name: str = Path(..., description="Project name"),
+    database_id: str = Path(..., description="Database ID"),
+):
+    """
+    List all backups for a database.
+
+    Returns a list of backup sessions with their status and metadata.
+    """
+    backups = await database_service.list_backups(
+        database_id=database_id,
+        domain=domain_name,
+        project=project_name,
+    )
+    return {
         "database_id": database_id,
         "domain": domain_name,
         "project": project_name,
-        "job_id": f"backup-{database_id}-pending",
+        "backups": backups,
+        "count": len(backups),
     }
     
     # Audit log
@@ -776,6 +798,26 @@ async def trigger_backup(
     return result
 
 
+@router.get("/{database_id}/backups/{backup_job_id}", status_code=status.HTTP_200_OK)
+async def get_backup_status(
+    domain_name: str = Path(..., description="Domain name"),
+    project_name: str = Path(..., description="Project name"),
+    database_id: str = Path(..., description="Database ID"),
+    backup_job_id: str = Path(..., description="Backup job ID"),
+):
+    """
+    Get the status of a specific backup job.
+
+    Returns detailed status information including phase, progress, and any errors.
+    """
+    return await database_service.get_backup_status(
+        database_id=database_id,
+        backup_job_id=backup_job_id,
+        domain=domain_name,
+        project=project_name,
+    )
+
+
 @router.post("/{database_id}/restore", status_code=status.HTTP_202_ACCEPTED)
 async def restore_database(
     request: Request,
@@ -783,6 +825,7 @@ async def restore_database(
     project_name: str = Path(..., description="Project name"),
     database_id: str = Path(..., description="Database ID"),
     backup_id: str = Query(..., description="Backup ID to restore from"),
+    restore_mode: str = Query("override", description="Restore mode: 'override' (restore to existing DB) or 'recreate' (delete and create new DB)"),
 ):
     """
     Restore database from a backup.
@@ -790,32 +833,27 @@ async def restore_database(
     **WARNING**: This will restore the database to the state at backup time.
     Recent data may be lost.
 
+    **Restore Modes:**
+    - **override** (default): Restore to existing database, overwriting current data
+    - **recreate**: Delete existing database, create new one with same config, then restore
+
     The restore operation is performed asynchronously.
     Returns a job ID to track restore progress.
     """
-    # TODO: Implement restore via KubeDB Stash
-    result = {
-        "message": "Restore initiated",
-        "database_id": database_id,
-        "domain": domain_name,
-        "project": project_name,
-        "backup_id": backup_id,
-        "job_id": f"restore-{database_id}-pending",
-    }
+    if restore_mode not in ["override", "recreate"]:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail="restore_mode must be either 'override' or 'recreate'"
+        )
     
-    # Audit log (critical operation)
-    audit_info = await _get_audit_info(request)
-    await audit_service.log_action(
-        action="database.restore",
-        resource_type="database",
-        resource_id=database_id,
+    return await database_service.restore_database(
+        database_id=database_id,
+        backup_id=backup_id,
         domain=domain_name,
         project=project_name,
-        **audit_info,
-        details={"backup_id": backup_id, "job_id": result["job_id"]},
+        restore_mode=restore_mode,
     )
-    
-    return result
 
 
 # ===============================================================================
@@ -1131,3 +1169,41 @@ async def update_upgrade_policy(
             "error": f"Failed to update upgrade policy: {str(e)}",
             "database_id": database_id,
         }
+
+
+@router.post("/{database_id}/restore", status_code=status.HTTP_202_ACCEPTED)
+async def restore_database(
+    request: Request,
+    domain_name: str = Path(..., description="Domain name"),
+    project_name: str = Path(..., description="Project name"),
+    database_id: str = Path(..., description="Database ID"),
+    backup_id: str = Query(..., description="Backup ID to restore from"),
+    restore_mode: str = Query("override", description="Restore mode: 'override' (restore to existing DB) or 'recreate' (delete and create new DB)"),
+):
+    """
+    Restore database from a backup.
+
+    **WARNING**: This will restore the database to the state at backup time.
+    Recent data may be lost.
+
+    **Restore Modes:**
+    - **override** (default): Restore to existing database, overwriting current data
+    - **recreate**: Delete existing database, create new one with same config, then restore
+
+    The restore operation is performed asynchronously.
+    Returns a job ID to track restore progress.
+    """
+    if restore_mode not in ["override", "recreate"]:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail="restore_mode must be either 'override' or 'recreate'"
+        )
+    
+    return await database_service.restore_database(
+        database_id=database_id,
+        backup_id=backup_id,
+        domain=domain_name,
+        project=project_name,
+        restore_mode=restore_mode,
+    )

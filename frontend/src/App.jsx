@@ -16,9 +16,14 @@ function App() {
   const [dbCredentials, setDbCredentials] = useState(null)
   const [dbMetrics, setDbMetrics] = useState(null)
   const [metricsLoading, setMetricsLoading] = useState(false)
+  const [dbBackups, setDbBackups] = useState([])
+  const [backupsLoading, setBackupsLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('overview')
   const [notification, setNotification] = useState(null)
-  const [view, setView] = useState('grid')
+  const [currentPage, setCurrentPage] = useState('databases') // 'databases', 'providers', 'backups'
+  const [view, setView] = useState('grid') // 'grid', 'list' for database view
+  const [allBackups, setAllBackups] = useState([])
+  const [allBackupsLoading, setAllBackupsLoading] = useState(false)
   const [metricSearch, setMetricSearch] = useState('')
   const [collapsedCategories, setCollapsedCategories] = useState({})
   const [availableUpgrades, setAvailableUpgrades] = useState([])
@@ -37,6 +42,7 @@ function App() {
     replicas: 1,
     backup_enabled: true,
     backup_schedule: 'daily',
+    backup_retention_days: 30,
     high_availability: false,
     monitoring_enabled: true,
     username: '',
@@ -163,10 +169,17 @@ function App() {
   const fetchDatabases = async () => {
     try {
       const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/`)
+      if (!response.ok) {
+        console.error('Failed to fetch databases:', response.status, response.statusText)
+        setLoading(false)
+        return
+      }
       const data = await response.json()
+      console.log('Fetched databases:', data.databases?.length || 0, 'databases')
       setDatabases(data.databases || [])
       setLoading(false)
     } catch (error) {
+      console.error('Error fetching databases:', error)
       setLoading(false)
     }
   }
@@ -211,7 +224,11 @@ function App() {
     setShowDetailsModal(true)
     setActiveTab('overview')
     setDbMetrics(null)
+    setDbBackups([])
     await fetchDbDetails(db.id)
+    if (db.backup_enabled) {
+      await fetchDbBackups(db.id)
+    }
   }
 
   const createDatabase = async (e) => {
@@ -228,7 +245,7 @@ function App() {
         setNewDb({
           name: '', engine: 'mongodb', version: '', size: 'db.t3.micro',
           storage_gb: 10, replicas: 1, backup_enabled: true, backup_schedule: 'daily',
-          high_availability: false, monitoring_enabled: true
+          backup_retention_days: 30, high_availability: false, monitoring_enabled: true
         })
         fetchDatabases()
       } else {
@@ -403,6 +420,116 @@ function App() {
     return icons[engine] || '🗄️'
   }
 
+  const fetchDbBackups = async (id) => {
+    setBackupsLoading(true)
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/backups`)
+      if (response.ok) {
+        const data = await response.json()
+        setDbBackups(data.backups || [])
+      } else {
+        setDbBackups([])
+      }
+    } catch (error) {
+      console.error('Failed to fetch backups:', error)
+      setDbBackups([])
+    } finally {
+      setBackupsLoading(false)
+    }
+  }
+
+  const triggerBackup = async (id) => {
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/backup`, {
+        method: 'POST'
+      })
+      if (response.ok) {
+        showNotification('Backup triggered successfully!', 'success')
+        await fetchDbBackups(id)
+        if (currentPage === 'backups') {
+          await fetchAllBackups()
+        }
+      } else {
+        const error = await response.json()
+        showNotification(error.error?.message || 'Failed to trigger backup', 'error')
+      }
+    } catch (error) {
+      showNotification('Failed to trigger backup', 'error')
+    }
+  }
+
+  const restoreDatabase = async (id, backupId) => {
+    if (!confirm(`Restore database from backup "${backupId}"? This will overwrite current data.`)) return
+    try {
+      const response = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${id}/restore?backup_id=${backupId}`, {
+        method: 'POST'
+      })
+      if (response.ok) {
+        showNotification('Restore initiated successfully!', 'success')
+        await fetchDbBackups(id)
+        if (currentPage === 'backups') {
+          await fetchAllBackups()
+        }
+      } else {
+        const error = await response.json()
+        showNotification(error.error?.message || 'Failed to restore database', 'error')
+      }
+    } catch (error) {
+      showNotification('Failed to restore database', 'error')
+    }
+  }
+
+  const fetchAllBackups = async () => {
+    setAllBackupsLoading(true)
+    try {
+      // Fetch all databases with backup enabled
+      const dbResponse = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/`)
+      if (!dbResponse.ok) {
+        throw new Error('Failed to fetch databases')
+      }
+      const dbData = await dbResponse.json()
+      const backupEnabledDbs = (dbData.databases || []).filter(db => db.backup_enabled && db.status === 'running')
+      
+      // Fetch backups for each database
+      const backupPromises = backupEnabledDbs.map(async (db) => {
+        try {
+          const backupResponse = await fetch(`${API_BASE}/domain/${DOMAIN}/project/${PROJECT}/databases/${db.id}/backups`)
+          if (backupResponse.ok) {
+            const backupData = await backupResponse.json()
+            return (backupData.backups || []).map(backup => ({
+              ...backup,
+              database_id: db.id,
+              database_name: db.name,
+              database_engine: db.engine
+            }))
+          }
+          return []
+        } catch (error) {
+          console.error(`Failed to fetch backups for ${db.name}:`, error)
+          return []
+        }
+      })
+      
+      const allBackupsArrays = await Promise.all(backupPromises)
+      const flattenedBackups = allBackupsArrays.flat()
+      
+      // Sort by created_at (newest first)
+      flattenedBackups.sort((a, b) => {
+        const dateA = new Date(a.created_at || 0)
+        const dateB = new Date(b.created_at || 0)
+        return dateB - dateA
+      })
+      
+      setAllBackups(flattenedBackups)
+    } catch (error) {
+      console.error('Failed to fetch all backups:', error)
+      setAllBackups([])
+      showNotification('Failed to fetch backups', 'error')
+    } finally {
+      setAllBackupsLoading(false)
+    }
+  }
+
   const getDefaultUsername = (engine) => {
     const defaults = {
       mariadb: 'root',
@@ -429,7 +556,10 @@ function App() {
           </div>
         </div>
         <nav className="sidebar-nav">
-          <button className="nav-item active">
+          <button 
+            className={currentPage === 'databases' ? 'nav-item active' : 'nav-item'}
+            onClick={() => setCurrentPage('databases')}
+          >
             <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>
             </svg>
@@ -442,7 +572,13 @@ function App() {
             </svg>
             <span>Monitoring</span>
           </button>
-          <button className="nav-item disabled">
+          <button 
+            className={currentPage === 'backups' ? 'nav-item active' : 'nav-item'}
+            onClick={() => {
+              setCurrentPage('backups')
+              fetchAllBackups()
+            }}
+          >
             <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
             </svg>
@@ -518,7 +654,150 @@ function App() {
           </div>
         )}
 
+        {/* Backups Page */}
+        {currentPage === 'backups' && (
+          <div className="backups-page">
+            <div style={{marginBottom: '2rem'}}>
+              <h2>💾 All Backups</h2>
+              <p className="subtitle">View and manage backups from all databases</p>
+            </div>
+
+            {allBackupsLoading ? (
+              <div className="loading">
+                <div className="spinner"></div>
+                <p>Loading backups...</p>
+              </div>
+            ) : allBackups.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">💾</div>
+                <h3>No backups found</h3>
+                <p>Backups will appear here once databases are backed up</p>
+              </div>
+            ) : (
+              <div className="backups-list-page">
+                <div style={{marginBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                  <div>
+                    <strong>Total Backups: {allBackups.length}</strong>
+                    <span style={{marginLeft: '1rem', color: '#6b7280', fontSize: '0.9rem'}}>
+                      Successful: {allBackups.filter(b => b.phase === 'Succeeded' || b.phase === 'Complete').length}
+                    </span>
+                  </div>
+                  <button 
+                    className="btn-secondary"
+                    onClick={fetchAllBackups}
+                    disabled={allBackupsLoading}
+                  >
+                    🔄 Refresh
+                  </button>
+                </div>
+
+                {allBackups.map((backup, idx) => {
+                  const getStatusColor = (phase) => {
+                    if (phase === 'Succeeded' || phase === 'Complete') return '#10b981'
+                    if (phase === 'Failed') return '#ef4444'
+                    if (phase === 'Running') return '#3b82f6'
+                    return '#6b7280'
+                  }
+                  
+                  const getStatusIcon = (phase) => {
+                    if (phase === 'Succeeded' || phase === 'Complete') return '✅'
+                    if (phase === 'Failed') return '❌'
+                    if (phase === 'Running') return '🔄'
+                    return '⏳'
+                  }
+
+                  let backupDate = backup.created_at || backup.backup_id
+                  if (backup.backup_id && backup.backup_id.includes('-')) {
+                    const parts = backup.backup_id.split('-')
+                    const timestamp = parts[parts.length - 1]
+                    if (timestamp && timestamp.length === 15) {
+                      const dateStr = timestamp.substring(0, 8)
+                      const timeStr = timestamp.substring(9, 15)
+                      backupDate = `${dateStr} ${timeStr.substring(0, 2)}:${timeStr.substring(2, 4)}:${timeStr.substring(4, 6)}`
+                    }
+                  }
+
+                  // Find database info
+                  const db = databases.find(d => d.id === backup.database_id)
+
+                  return (
+                    <div key={idx} className="backup-item-card" style={{
+                      border: '1px solid #e5e7eb',
+                      borderRadius: '12px',
+                      padding: '1.5rem',
+                      marginBottom: '1rem',
+                      background: 'white',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+                    }}>
+                      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start'}}>
+                        <div style={{flex: 1}}>
+                          <div style={{display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem'}}>
+                            <span style={{fontSize: '1.5rem'}}>{getStatusIcon(backup.phase)}</span>
+                            <div>
+                              <h4 style={{margin: 0, fontSize: '1.1rem'}}>{backup.backup_id}</h4>
+                              <p style={{margin: '0.25rem 0 0 0', color: '#6b7280', fontSize: '0.9rem'}}>
+                                Database: <strong>{backup.database_name || 'Unknown'}</strong> ({backup.database_engine || 'unknown'})
+                              </p>
+                            </div>
+                            <span style={{
+                              backgroundColor: getStatusColor(backup.phase),
+                              color: 'white',
+                              padding: '0.35rem 0.75rem',
+                              borderRadius: '6px',
+                              fontSize: '0.85rem',
+                              fontWeight: 'bold'
+                            }}>
+                              {backup.phase}
+                            </span>
+                          </div>
+                          <div style={{fontSize: '0.85rem', color: '#6b7280', marginTop: '0.5rem'}}>
+                            <div>Created: {backupDate}</div>
+                            {backup.type && <div>Type: {backup.type}</div>}
+                            {db && (
+                              <div style={{marginTop: '0.5rem'}}>
+                                <button
+                                  className="btn-secondary"
+                                  onClick={() => {
+                                    setCurrentPage('databases')
+                                    setTimeout(() => openDetails(db), 100)
+                                  }}
+                                  style={{padding: '0.4rem 0.8rem', fontSize: '0.85rem'}}
+                                >
+                                  View Database
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <div>
+                          {(backup.phase === 'Succeeded' || backup.phase === 'Complete') && backup.database_id && (
+                            <button
+                              className="btn-primary"
+                              onClick={() => {
+                                let restoreId = backup.backup_id
+                                if (backup.backup_id.includes('backup-')) {
+                                  restoreId = backup.backup_id.split('backup-')[1]
+                                }
+                                restoreDatabase(backup.database_id, restoreId)
+                              }}
+                              style={{padding: '0.5rem 1rem'}}
+                            >
+                              🔄 Restore
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Database Grid/List */}
+        {currentPage === 'databases' && (
+          <>
         {loading ? (
           <div className="loading">
             <div className="spinner"></div>
@@ -607,6 +886,8 @@ function App() {
               </div>
             ))}
           </div>
+        )}
+          </>
         )}
       </div>
 
@@ -733,10 +1014,13 @@ function App() {
                               // Get versions for selected engine from availableEngines
                               const versions = availableEngines[engine] || []
                               setAvailableVersions(versions)
+                              // MongoDB requires minimum 2 replicas
+                              const replicas = (engine === 'mongodb' && newDb.replicas < 2) ? 2 : newDb.replicas
                               setNewDb({
                                 ...newDb,
                                 engine,
-                                version: versions.length > 0 ? versions[0].version : ''
+                                version: versions.length > 0 ? versions[0].version : '',
+                                replicas: replicas
                               })
                             }}
                             className="select-large"
@@ -840,19 +1124,34 @@ function App() {
                           <label>
                             <span>Replicas</span>
                             <span className="value-badge">{newDb.replicas}</span>
+                            {newDb.engine === 'mongodb' && newDb.replicas < 2 && (
+                              <span style={{color: '#ef4444', fontSize: '0.75rem', marginLeft: '0.5rem'}}>
+                                ⚠️ MongoDB requires minimum 2 replicas
+                              </span>
+                            )}
                           </label>
                           <input
                             type="range"
-                            min="1"
+                            min={newDb.engine === 'mongodb' ? 2 : 1}
                             max="5"
-                            value={newDb.replicas}
-                            onChange={(e) => setNewDb({ ...newDb, replicas: parseInt(e.target.value) })}
+                            value={newDb.engine === 'mongodb' && newDb.replicas < 2 ? 2 : newDb.replicas}
+                            onChange={(e) => {
+                              const replicas = parseInt(e.target.value)
+                              // MongoDB requires minimum 2
+                              const finalReplicas = (newDb.engine === 'mongodb' && replicas < 2) ? 2 : replicas
+                              setNewDb({ ...newDb, replicas: finalReplicas })
+                            }}
                             className="slider"
                           />
                           <div className="slider-labels">
-                            <span>1</span>
+                            <span>{newDb.engine === 'mongodb' ? 2 : 1}</span>
                             <span>5</span>
                           </div>
+                          {newDb.engine === 'mongodb' && (
+                            <small style={{color: '#6b7280', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block'}}>
+                              MongoDB replicaset requires minimum 2 replicas for quorum
+                            </small>
+                          )}
                         </div>
 
                         <div className="slider-group">
@@ -885,31 +1184,59 @@ function App() {
                   <div className="section-content">
                     <h3>Features</h3>
                     <div className="feature-toggles">
-                      <div className={`feature-card ${newDb.backup_enabled ? 'active' : ''}`}>
-                        <label className="feature-toggle">
+                      <div className={`feature-card ${newDb.backup_enabled ? 'active' : ''}`} style={{border: newDb.backup_enabled ? '2px solid #10b981' : '1px solid #e5e7eb'}}>
+                        <label className="feature-toggle" style={{cursor: 'pointer'}}>
                           <input
                             type="checkbox"
                             checked={newDb.backup_enabled}
                             onChange={(e) => setNewDb({ ...newDb, backup_enabled: e.target.checked })}
+                            style={{width: '20px', height: '20px', cursor: 'pointer'}}
                           />
                           <div className="toggle-content">
                             <div className="toggle-header">
-                              <span className="toggle-icon">💾</span>
-                              <span className="toggle-title">Automated Backups</span>
+                              <span className="toggle-icon" style={{fontSize: '1.5rem'}}>💾</span>
+                              <span className="toggle-title" style={{fontSize: '1.1rem', fontWeight: 'bold'}}>Automated Backups</span>
                             </div>
-                            <span className="toggle-desc">Daily snapshots with point-in-time recovery</span>
+                            <span className="toggle-desc">Enable automated backups with configurable schedule and retention</span>
                           </div>
                         </label>
                         {newDb.backup_enabled && (
-                          <select
-                            value={newDb.backup_schedule}
-                            onChange={(e) => setNewDb({ ...newDb, backup_schedule: e.target.value })}
-                            className="feature-option"
-                          >
-                            <option value="hourly">⏱️ Every Hour</option>
-                            <option value="daily">📅 Daily</option>
-                            <option value="weekly">📆 Weekly</option>
-                          </select>
+                          <div style={{marginTop: '1rem', padding: '1rem', background: '#f0fdf4', borderRadius: '8px', border: '1px solid #86efac'}}>
+                            <div style={{marginBottom: '0.75rem'}}>
+                              <label style={{display: 'block', marginBottom: '0.5rem', fontWeight: '600', fontSize: '0.9rem'}}>
+                                Backup Schedule:
+                              </label>
+                              <select
+                                value={newDb.backup_schedule}
+                                onChange={(e) => setNewDb({ ...newDb, backup_schedule: e.target.value })}
+                                style={{width: '100%', padding: '0.5rem', borderRadius: '6px', border: '1px solid #d1d5db'}}
+                              >
+                                <option value="hourly">⏱️ Every Hour</option>
+                                <option value="daily">📅 Daily (Recommended)</option>
+                                <option value="weekly">📆 Weekly</option>
+                              </select>
+                            </div>
+                            <div>
+                              <label style={{display: 'block', marginBottom: '0.5rem', fontWeight: '600', fontSize: '0.9rem'}}>
+                                Retention Days: {newDb.backup_retention_days} days
+                              </label>
+                              <input
+                                type="range"
+                                min="1"
+                                max="365"
+                                value={newDb.backup_retention_days}
+                                onChange={(e) => setNewDb({ ...newDb, backup_retention_days: parseInt(e.target.value) })}
+                                style={{width: '100%'}}
+                              />
+                              <div style={{display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: '#6b7280', marginTop: '0.25rem'}}>
+                                <span>1 day</span>
+                                <span>365 days</span>
+                              </div>
+                            </div>
+                            <div style={{marginTop: '0.75rem', padding: '0.5rem', background: '#dbeafe', borderRadius: '6px', fontSize: '0.85rem', color: '#1e40af'}}>
+                              ✅ Backups will be stored in S3 and available for {newDb.backup_retention_days} days
+                            </div>
+                          </div>
                         )}
                       </div>
 
@@ -1016,6 +1343,20 @@ function App() {
               >
                 Actions
               </button>
+              {(selectedDb?.backup_enabled === true || selectedDb?.backup_enabled === 'true') && (
+                <button
+                  className={activeTab === 'backups' ? 'tab active' : 'tab'}
+                  onClick={() => {
+                    setActiveTab('backups')
+                    if (selectedDb && dbBackups.length === 0) {
+                      fetchDbBackups(selectedDb.id)
+                    }
+                  }}
+                  style={{display: 'block'}}
+                >
+                  💾 Backups
+                </button>
+              )}
             </div>
 
             <div className="modal-body">
@@ -1878,6 +2219,115 @@ function App() {
                         Delete
                       </button>
                     </div>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'backups' && (
+                <div className="tab-content">
+                  <div className="backups-section">
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem'}}>
+                      <h4>💾 Database Backups</h4>
+                      <button
+                        className="btn-primary"
+                        onClick={() => triggerBackup(selectedDb.id)}
+                        disabled={selectedDb.status !== 'running'}
+                        style={{padding: '0.5rem 1rem'}}
+                      >
+                        + Trigger Backup
+                      </button>
+                    </div>
+
+                    {backupsLoading ? (
+                      <div style={{textAlign: 'center', padding: '2rem'}}>Loading backups...</div>
+                    ) : dbBackups.length === 0 ? (
+                      <div style={{textAlign: 'center', padding: '2rem', color: '#6b7280'}}>
+                        <p>No backups found</p>
+                        <p style={{fontSize: '0.9rem', marginTop: '0.5rem'}}>Trigger a backup to get started</p>
+                      </div>
+                    ) : (
+                      <div className="backups-list">
+                        {dbBackups.map((backup, idx) => {
+                          const getStatusColor = (phase) => {
+                            if (phase === 'Succeeded' || phase === 'Complete') return '#10b981'
+                            if (phase === 'Failed') return '#ef4444'
+                            if (phase === 'Running') return '#3b82f6'
+                            return '#6b7280'
+                          }
+                          
+                          const getStatusIcon = (phase) => {
+                            if (phase === 'Succeeded' || phase === 'Complete') return '✅'
+                            if (phase === 'Failed') return '❌'
+                            if (phase === 'Running') return '🔄'
+                            return '⏳'
+                          }
+
+                          // Extract timestamp from backup_id if available
+                          let backupDate = backup.created_at || backup.backup_id
+                          if (backup.backup_id && backup.backup_id.includes('-')) {
+                            const parts = backup.backup_id.split('-')
+                            const timestamp = parts[parts.length - 1]
+                            if (timestamp && timestamp.length === 15) {
+                              // Format: 20251222-174930
+                              const dateStr = timestamp.substring(0, 8)
+                              const timeStr = timestamp.substring(9, 15)
+                              backupDate = `${dateStr} ${timeStr.substring(0, 2)}:${timeStr.substring(2, 4)}:${timeStr.substring(4, 6)}`
+                            }
+                          }
+
+                          return (
+                            <div key={idx} className="backup-item" style={{
+                              border: '1px solid #e5e7eb',
+                              borderRadius: '8px',
+                              padding: '1rem',
+                              marginBottom: '1rem',
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center'
+                            }}>
+                              <div style={{flex: 1}}>
+                                <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem'}}>
+                                  <span style={{fontSize: '1.2rem'}}>{getStatusIcon(backup.phase)}</span>
+                                  <strong>{backup.backup_id}</strong>
+                                  <span style={{
+                                    backgroundColor: getStatusColor(backup.phase),
+                                    color: 'white',
+                                    padding: '0.25rem 0.5rem',
+                                    borderRadius: '4px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 'bold'
+                                  }}>
+                                    {backup.phase}
+                                  </span>
+                                </div>
+                                <div style={{fontSize: '0.85rem', color: '#6b7280'}}>
+                                  <div>Created: {backupDate}</div>
+                                  {backup.type && <div>Type: {backup.type}</div>}
+                                </div>
+                              </div>
+                              <div>
+                                {(backup.phase === 'Succeeded' || backup.phase === 'Complete') && (
+                                  <button
+                                    className="btn-secondary"
+                                    onClick={() => {
+                                      // Extract timestamp from backup_id for restore
+                                      let restoreId = backup.backup_id
+                                      if (backup.backup_id.includes('backup-')) {
+                                        restoreId = backup.backup_id.split('backup-')[1]
+                                      }
+                                      restoreDatabase(selectedDb.id, restoreId)
+                                    }}
+                                    style={{padding: '0.5rem 1rem', marginLeft: '0.5rem'}}
+                                  >
+                                    🔄 Restore
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

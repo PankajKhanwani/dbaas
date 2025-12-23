@@ -12,6 +12,7 @@ Reconciliation Pattern:
 5. Handle errors gracefully without stopping the reconciler
 """
 import asyncio
+import tempfile
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 
@@ -964,7 +965,13 @@ class DatabaseReconciler:
                             "changing_status_to_running_no_active_operation",
                             database_id=db.id,
                         )
+                        old_status_value = db.status
                         db.status = mapped_status
+                        await db.save()
+                        
+                        # Trigger initial backup if database just became RUNNING and backup is enabled
+                        if old_status_value != DatabaseStatus.RUNNING and db.backup_enabled:
+                            await self._trigger_initial_backup(db, provider_id, kubeconfig_content)
                     else:
                         logger.info(
                             "keeping_updating_status_active_operation_exists",
@@ -991,6 +998,28 @@ class DatabaseReconciler:
                     )
                     # Don't fail the entire reconciliation if OpsRequest check fails
 
+            # Trigger backup for RUNNING databases if backup is enabled and no backup job exists
+            # Make sure endpoint is fetched first
+            if is_ready and db.status == DatabaseStatus.RUNNING and db.backup_enabled:
+                # Ensure endpoint is set before triggering backup
+                if not db.endpoint:
+                    endpoint_info = await kubedb_service.get_database_endpoint(
+                        engine=db.engine,
+                        name=db.kubedb_resource_name,
+                        namespace=db.namespace,
+                        provider_id=provider_id,
+                        kubeconfig_content=kubeconfig_content,
+                    )
+                    if endpoint_info:
+                        db.endpoint = endpoint_info.get("host")
+                        db.port = endpoint_info.get("port")
+                        await db.save()
+                
+                # Check if backup was already triggered (avoid duplicate checks on every sync)
+                # We'll trigger backup if no backup job exists
+                if db.endpoint:  # Only trigger if endpoint is available
+                    await self._ensure_backup_triggered(db, provider_id, kubeconfig_content)
+            
             # Reconcile resources/size to ensure pods match desired state
             # This ensures the database stays at the configured size
             # Run for RUNNING, UPDATING, and SCALING databases that are ready
@@ -1613,8 +1642,13 @@ class DatabaseReconciler:
                         "database_up_to_date_setting_running",
                         database_id=db.id,
                     )
+                    old_status_value = db.status
                     db.status = DatabaseStatus.RUNNING
                     await db.save()
+                    
+                    # Trigger initial backup if database just became RUNNING and backup is enabled
+                    if old_status_value != DatabaseStatus.RUNNING and db.backup_enabled:
+                        await self._trigger_initial_backup(db, provider_id, kubeconfig_content)
                 else:
                     logger.info(
                         "database_up_to_date_but_active_operation_exists",
@@ -2014,6 +2048,312 @@ class DatabaseReconciler:
             logger.info(
                 "ops_requests_cleanup_completed",
                 total_cleaned=total_cleaned,
+            )
+
+    async def _ensure_backup_triggered(
+        self,
+        db: Database,
+        provider_id: str,
+        kubeconfig_content: str,
+    ) -> None:
+        """
+        Ensure backup is triggered for a RUNNING database (checks if backup job exists).
+        
+        Args:
+            db: Database instance
+            provider_id: Provider ID
+            kubeconfig_content: Provider's kubeconfig content
+        """
+        from app.config.settings import settings
+        
+        if not settings.backup_enabled or not db.backup_enabled:
+            return
+        
+        # CRITICAL: Check if database is RUNNING before triggering backup
+        if db.status != DatabaseStatus.RUNNING:
+            logger.debug(
+                "database_not_running_skipping_backup",
+                database_id=db.id,
+                status=db.status.value,
+            )
+            return
+        
+        # Check if endpoint is available (database must be accessible)
+        if not db.endpoint:
+            logger.debug(
+                "database_endpoint_not_available_skipping_backup",
+                database_id=db.id,
+            )
+            return
+        
+        try:
+            # Check if backup job already exists based on schedule frequency
+            import base64
+            decoded_content = base64.b64decode(kubeconfig_content).decode('utf-8')
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as f:
+                f.write(decoded_content)
+                temp_kubeconfig = f.name
+            
+            try:
+                from kubernetes_asyncio import client, config
+                await config.load_kube_config(config_file=temp_kubeconfig)
+                batch_api = client.BatchV1Api()
+                
+                # Get backup schedule (default to daily)
+                backup_schedule = db.backup_schedule.value if db.backup_schedule else "daily"
+                
+                # Determine time window based on schedule
+                from datetime import datetime, timedelta
+                now = datetime.utcnow()
+                
+                if backup_schedule == "hourly":
+                    # Check for backup in last hour
+                    time_window = now - timedelta(hours=1)
+                    period_name = "hour"
+                elif backup_schedule == "daily":
+                    # Check for backup today (last 24 hours)
+                    time_window = now - timedelta(days=1)
+                    period_name = "day"
+                elif backup_schedule == "weekly":
+                    # Check for backup this week (last 7 days)
+                    time_window = now - timedelta(days=7)
+                    period_name = "week"
+                else:
+                    # Default to daily
+                    time_window = now - timedelta(days=1)
+                    period_name = "day"
+                
+                # Check for existing backup jobs
+                jobs = await batch_api.list_namespaced_job(
+                    namespace=db.namespace,
+                    label_selector=f"database={db.kubedb_resource_name},backup-type=direct",
+                )
+                
+                has_running_job = False
+                has_recent_job = False  # Any job (running, succeeded, or failed) in the period
+                recent_backup_job = None
+                most_recent_job_time = None
+                
+                logger.debug(
+                    "checking_backup_jobs",
+                    database_id=db.id,
+                    schedule=backup_schedule,
+                    total_jobs=len(jobs.items),
+                    time_window=time_window.isoformat(),
+                    now=now.isoformat(),
+                )
+                
+                # Check ALL jobs - we want to prevent ANY job creation in the period, not just successful ones
+                for job in jobs.items:
+                    if not job.metadata.creation_timestamp:
+                        continue
+                    
+                    # Handle timezone-aware and timezone-naive timestamps
+                    created_time = job.metadata.creation_timestamp
+                    if created_time.tzinfo is not None:
+                        created_time = created_time.replace(tzinfo=None)
+                    
+                    time_diff = (now - created_time).total_seconds()
+                    
+                    # Check if job was created within the time window
+                    if created_time > time_window:
+                        # Job was created in current period
+                        has_recent_job = True
+                        recent_backup_job = job.metadata.name
+                        most_recent_job_time = created_time
+                        
+                        # If job is running, definitely skip
+                        if job.status.active:
+                            has_running_job = True
+                            logger.info(
+                                "backup_job_running_in_period_skipping",
+                                database_id=db.id,
+                                job_name=job.metadata.name,
+                                schedule=backup_schedule,
+                                created_at=created_time.isoformat(),
+                                time_diff_seconds=time_diff,
+                            )
+                            break
+                        elif job.status.succeeded:
+                            logger.info(
+                                "backup_already_done_for_period",
+                                database_id=db.id,
+                                schedule=backup_schedule,
+                                period=period_name,
+                                job_name=job.metadata.name,
+                                created_at=created_time.isoformat(),
+                                time_diff_seconds=time_diff,
+                            )
+                            break
+                        elif job.status.failed:
+                            # Even if failed, we had a backup attempt in this period
+                            # For daily/weekly, we don't retry immediately
+                            logger.info(
+                                "backup_attempted_in_period_skipping",
+                                database_id=db.id,
+                                schedule=backup_schedule,
+                                period=period_name,
+                                job_name=job.metadata.name,
+                                status="failed",
+                                created_at=created_time.isoformat(),
+                                time_diff_seconds=time_diff,
+                            )
+                            break
+                
+                # If ANY job exists in current period (running, succeeded, or failed), skip
+                if has_running_job or has_recent_job:
+                    logger.info(
+                        "backup_skipped_frequency_check",
+                        database_id=db.id,
+                        schedule=backup_schedule,
+                        period=period_name,
+                        has_running=has_running_job,
+                        has_recent_job=has_recent_job,
+                        recent_job=recent_backup_job,
+                        recent_job_time=most_recent_job_time.isoformat() if most_recent_job_time else None,
+                    )
+                    return
+                
+                logger.info(
+                    "triggering_scheduled_backup",
+                    database_id=db.id,
+                    schedule=backup_schedule,
+                    period=period_name,
+                )
+                
+            except Exception as check_error:
+                logger.warning(
+                    "failed_to_check_existing_backups",
+                    database_id=db.id,
+                    error=str(check_error),
+                )
+                # Continue to trigger backup if check fails (better to have backup than not)
+            finally:
+                import os
+                if os.path.exists(temp_kubeconfig):
+                    os.unlink(temp_kubeconfig)
+            
+            # No backup exists for current period, trigger backup
+            await self._trigger_initial_backup(db, provider_id, kubeconfig_content)
+            
+        except Exception as e:
+            logger.warning(
+                "ensure_backup_triggered_failed",
+                database_id=db.id,
+                error=str(e),
+            )
+
+    async def _trigger_initial_backup(
+        self,
+        db: Database,
+        provider_id: str,
+        kubeconfig_content: str,
+    ) -> None:
+        """
+        Trigger initial backup for a database that just became RUNNING.
+        
+        Args:
+            db: Database instance
+            provider_id: Provider ID
+            kubeconfig_content: Provider's kubeconfig content
+        """
+        from app.config.settings import settings
+        from app.services.database_service import DatabaseService
+        
+        if not settings.backup_enabled:
+            return
+        
+        try:
+            database_service = DatabaseService()
+            
+            # Get database credentials for backup
+            try:
+                db_credentials_obj = await database_service.get_credentials(db.id, db.domain, db.project)
+                db_credentials = {
+                    "username": db_credentials_obj.username,
+                    "password": db_credentials_obj.password,
+                    "database": db_credentials_obj.database or ("postgres" if db.engine.value == "postgres" else db.name),
+                }
+            except Exception as cred_error:
+                logger.warning(
+                    "failed_to_get_credentials_for_initial_backup",
+                    database_id=db.id,
+                    error=str(cred_error),
+                )
+                # Use default credentials
+                default_db = "postgres" if db.engine.value == "postgres" else (db.name if db.engine.value == "mysql" else "admin")
+                db_credentials = {
+                    "username": "postgres" if db.engine.value == "postgres" else "root",
+                    "password": "",
+                    "database": default_db,
+                }
+            
+            # For PostgreSQL, use "postgres" database for backup
+            backup_db_name = "postgres" if db.engine.value == "postgres" else db_credentials.get("database", db.name)
+            
+            # Check if backup job already exists (avoid duplicate backups)
+            from kubernetes_asyncio import client, config
+            import base64
+            decoded_content = base64.b64decode(kubeconfig_content).decode('utf-8')
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as f:
+                f.write(decoded_content)
+                temp_kubeconfig = f.name
+            
+            try:
+                await config.load_kube_config(config_file=temp_kubeconfig)
+                batch_api = client.BatchV1Api()
+                
+                # Check for existing backup jobs
+                jobs = await batch_api.list_namespaced_job(
+                    namespace=db.namespace,
+                    label_selector=f"database={db.kubedb_resource_name},backup-type=direct",
+                )
+                
+                # If backup job already exists, skip
+                if jobs.items:
+                    logger.info(
+                        "backup_job_already_exists_skipping",
+                        database_id=db.id,
+                        existing_jobs=len(jobs.items),
+                    )
+                    return
+            except Exception as check_error:
+                logger.debug("failed_to_check_existing_backups", error=str(check_error))
+            finally:
+                import os
+                if os.path.exists(temp_kubeconfig):
+                    os.unlink(temp_kubeconfig)
+            
+            # Trigger direct backup job
+            await kubedb_service.create_backup_job_direct(
+                database_name=db.kubedb_resource_name,
+                database_engine=db.engine,
+                namespace=db.namespace,
+                database_host=db.endpoint or "localhost",
+                database_port=db.port or 5432,
+                database_user=db_credentials.get("username", "postgres"),
+                database_password=db_credentials.get("password", ""),
+                database_name_db=backup_db_name,
+                bucket=settings.backup_s3_bucket,
+                region=settings.backup_s3_region,
+                endpoint=settings.backup_s3_endpoint,
+                access_key_id=settings.backup_s3_access_key_id,
+                secret_access_key=settings.backup_s3_secret_access_key,
+                provider_id=provider_id,
+                kubeconfig_content=kubeconfig_content,
+            )
+
+            logger.info(
+                "initial_backup_triggered_from_status_sync",
+                database_id=db.id,
+                database_name=db.kubedb_resource_name,
+            )
+        except Exception as backup_error:
+            # Don't fail status sync if backup fails
+            logger.warning(
+                "initial_backup_failed_from_status_sync",
+                database_id=db.id,
+                error=str(backup_error),
             )
 
 
