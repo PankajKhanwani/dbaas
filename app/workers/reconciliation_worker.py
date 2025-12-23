@@ -514,6 +514,37 @@ class ReconciliationWorker:
                 error=str(e),
             )
 
+    def _get_vertical_scaling_topology_key(self, engine) -> str:
+        """
+        Get the topology key used in verticalScaling spec based on database engine.
+
+        This MUST match the logic in kubedb_service.py:create_vertical_scaling_ops_request
+        to ensure we can correctly detect if a completed OpsRequest matches desired state.
+
+        Args:
+            engine: DatabaseEngine enum
+
+        Returns:
+            Topology key string (e.g., "replicaSet", "postgres", "mysql", etc.)
+        """
+        from app.models.database import DatabaseEngine
+
+        if engine == DatabaseEngine.MONGODB:
+            return "replicaSet"
+        elif engine == DatabaseEngine.POSTGRES:
+            return "postgres"
+        elif engine == DatabaseEngine.MYSQL:
+            return "mysql"
+        elif engine == DatabaseEngine.MARIADB:
+            return "mariadb"
+        elif engine == DatabaseEngine.REDIS:
+            return "redis"
+        elif engine == DatabaseEngine.ELASTICSEARCH:
+            return "node"
+        else:
+            # Default to replicaSet for unknown engines
+            return "replicaSet"
+
     async def _create_reconciliation_operation(
         self,
         db: Database,
@@ -573,21 +604,36 @@ class ReconciliationWorker:
                 # Check if this OpsRequest matches the desired state
                 ops_spec = latest_successful.get("spec", {})
                 matches_desired = False
-                
+
                 if operation_type == OperationType.SCALE_VERTICAL:
                     vertical_scaling = ops_spec.get("verticalScaling", {})
-                    replica_set_resources = vertical_scaling.get("replicaSet", {}).get("resources", {})
-                    requests = replica_set_resources.get("requests", {})
-                    
+
+                    # Get the correct topology key for this database engine
+                    # This ensures we check the right field in the OpsRequest spec
+                    topology_key = self._get_vertical_scaling_topology_key(db.engine)
+                    topology_resources = vertical_scaling.get(topology_key, {}).get("resources", {})
+                    requests = topology_resources.get("requests", {})
+
                     from app.models.database import DatabaseSize
                     target_size = DatabaseSize(desired_state["size"])
                     expected_resources = kubedb_service._get_resource_limits(target_size)
-                    
+
                     ops_cpu = str(requests.get("cpu", ""))
                     ops_memory = str(requests.get("memory", ""))
                     expected_cpu = str(expected_resources.get("cpu", ""))
                     expected_memory = str(expected_resources.get("memory", ""))
-                    
+
+                    logger.debug(
+                        "checking_vertical_scaling_ops_match",
+                        database_id=db.id,
+                        engine=db.engine.value,
+                        topology_key=topology_key,
+                        ops_cpu=ops_cpu,
+                        ops_memory=ops_memory,
+                        expected_cpu=expected_cpu,
+                        expected_memory=expected_memory,
+                    )
+
                     if ops_cpu == expected_cpu and ops_memory == expected_memory:
                         matches_desired = True
                 elif operation_type == OperationType.SCALE_HORIZONTAL:

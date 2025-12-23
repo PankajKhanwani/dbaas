@@ -50,15 +50,37 @@ async def get_available_versions(
     - Get MongoDB versions only: `GET /api/v1/versions/?engine=mongodb`
     - Get MariaDB versions only: `GET /api/v1/versions/?engine=mariadb`
     """
-    # Convert string engine to enum if provided
-    engine_enum = None
+    # Return static versions (no provider needed for version listing)
+    static_versions = {
+        "mongodb": [
+            {"version": "8.0.4", "name": "8.0.4", "deprecated": False},
+            {"version": "8.0.3", "name": "8.0.3", "deprecated": False},
+            {"version": "7.0.21", "name": "7.0.21", "deprecated": False},
+        ],
+        "postgres": [
+            {"version": "16.4", "name": "16.4", "deprecated": False},
+            {"version": "16.2", "name": "16.2", "deprecated": False},
+            {"version": "15.8", "name": "15.8", "deprecated": False},
+        ],
+        "mysql": [
+            {"version": "8.0.40", "name": "8.0.40", "deprecated": False},
+            {"version": "8.0.35", "name": "8.0.35", "deprecated": False},
+        ],
+        "redis": [
+            {"version": "7.2", "name": "7.2", "deprecated": False},
+            {"version": "7.0", "name": "7.0", "deprecated": False},
+        ],
+        "elasticsearch": [
+            {"version": "8.11.0", "name": "8.11.0", "deprecated": False},
+        ],
+    }
+    
+    # Filter by engine if provided
     if engine:
         try:
             engine_enum = DatabaseEngine(engine.lower())
+            return {engine_enum.value: static_versions.get(engine_enum.value, [])}
         except ValueError:
-            # Invalid engine, will return empty result
             return {"error": f"Invalid engine: {engine}. Valid options: mongodb, postgres, mysql, mariadb, redis, elasticsearch"}
-
-    versions = await kubedb_service.get_available_versions(engine=engine_enum)
-
-    return versions
+    
+    return static_versions

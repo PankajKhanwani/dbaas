@@ -111,7 +111,23 @@ class Settings(BaseSettings):
     backup_storage_type: str = Field(default="s3", description="Backup storage type (s3/gcs/azure)")
     backup_s3_bucket: Optional[str] = Field(default=None, description="S3 bucket for backups")
     backup_s3_region: Optional[str] = Field(default="us-east-1", description="S3 region")
+    backup_s3_endpoint: Optional[str] = Field(
+        default="https://south-az2-s3.cloud.airtel.in:10444",
+        description="S3 endpoint URL (for S3-compatible storage)"
+    )
+    backup_s3_access_key_id: Optional[str] = Field(
+        default="PIY82HBAY3KLGL60SE7A",
+        description="S3 access key ID"
+    )
+    backup_s3_secret_access_key: Optional[str] = Field(
+        default="XhjRuatClbAXoGw+yDb60Gl5bPNakE49qoP6N9kI",
+        description="S3 secret access key"
+    )
     backup_retention_days: int = Field(default=30, ge=1, le=365, description="Backup retention in days")
+    # Stash/KubeStash configuration
+    stash_enabled: bool = Field(default=True, description="Enable Stash/KubeStash for backups")
+    stash_group: str = Field(default="stash.appscode.com", description="Stash API group")
+    stash_version: str = Field(default="v1beta1", description="Stash API version")
 
     # Database Reconciler
     reconcile_interval: int = Field(default=300, ge=10, le=3600, description="Reconciliation interval in seconds (default: 5 minutes)")
@@ -123,7 +139,7 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: List[str] = Field(
-        default=["http://localhost:3000"], description="CORS allowed origins"
+        default=["http://localhost:3000", "http://localhost:5173"], description="CORS allowed origins"
     )
     cors_allow_credentials: bool = Field(default=True, description="CORS allow credentials")
     cors_allow_methods: List[str] = Field(default=["*"], description="CORS allowed methods")
