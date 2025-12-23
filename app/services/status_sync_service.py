@@ -578,6 +578,83 @@ class DatabaseReconciler:
                 )
                 return  # Exit after deletion is handled
 
+            # Handle FAILED status - preserve it unless explicitly resolved
+            # FAILED status should only change to RUNNING when:
+            # 1. There's no drift (desired == current)
+            # 2. Database is actually healthy (K8s phase is Ready/Running)
+            # 3. No active OpsRequests
+            # 4. User hasn't explicitly requested a change
+            if db.status == DatabaseStatus.FAILED:
+                # Check if database is actually healthy now and there's no drift
+                is_healthy = phase.lower() in ["ready", "running"] and is_ready
+                has_drift = False
+                
+                # Check for drift: compare desired vs current
+                try:
+                    # Check size drift
+                    if db.size and db.current_size and db.size != db.current_size:
+                        has_drift = True
+                        logger.debug(
+                            "failed_status_has_size_drift",
+                            database_id=db.id,
+                            desired_size=db.size.value,
+                            current_size=db.current_size.value if db.current_size else None,
+                        )
+                    # Check replica drift
+                    if db.replicas and db.current_replicas and db.replicas != db.current_replicas:
+                        has_drift = True
+                        logger.debug(
+                            "failed_status_has_replica_drift",
+                            database_id=db.id,
+                            desired_replicas=db.replicas,
+                            current_replicas=db.current_replicas,
+                        )
+                    # Check storage drift
+                    if db.storage_gb and db.current_storage_gb and db.storage_gb != db.current_storage_gb:
+                        has_drift = True
+                        logger.debug(
+                            "failed_status_has_storage_drift",
+                            database_id=db.id,
+                            desired_storage=db.storage_gb,
+                            current_storage=db.current_storage_gb,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "failed_to_check_drift_for_failed_status",
+                        database_id=db.id,
+                        error=str(e),
+                    )
+                
+                # Check for active OpsRequests
+                has_active_ops = await self._has_active_ops_request(db, provider_id, kubeconfig_content)
+                
+                # Only transition from FAILED to RUNNING if:
+                # - Database is healthy
+                # - No drift
+                # - No active OpsRequests
+                if is_healthy and not has_drift and not has_active_ops:
+                    logger.info(
+                        "failed_status_resolved_transitioning_to_running",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                        is_ready=is_ready,
+                        message="Database is healthy, no drift, no active OpsRequests - transitioning from FAILED to RUNNING",
+                    )
+                    # Don't return - let status be updated to RUNNING below
+                else:
+                    # Keep FAILED status
+                    logger.debug(
+                        "preserving_failed_status",
+                        database_id=db.id,
+                        kubedb_phase=phase,
+                        is_healthy=is_healthy,
+                        has_drift=has_drift,
+                        has_active_ops=has_active_ops,
+                        message="Database status is FAILED - preserving until explicitly resolved",
+                    )
+                    await db.save()
+                    return  # Exit - don't change status
+
             # Handle PAUSING/PAUSED/RESUMING status transitions based on K8s phase
             if db.status == DatabaseStatus.PAUSING:
                 # Database is being paused - check if pause completed
@@ -757,13 +834,25 @@ class DatabaseReconciler:
                         # If latest OpsRequest is successful, it's safe to change to RUNNING
                         if latest_phase == "Successful":
                             mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
-                            db.status = mapped_status
-                            logger.info(
-                                "changing_status_from_updating_opsrequest_completed",
-                                database_id=db.id,
-                                new_status=mapped_status.value,
-                                kubedb_phase=phase,
-                            )
+
+                            # If OpsRequest succeeded but phase is still "failed", don't set to FAILED
+                            # The database might be recovering - give it time to reach Ready state
+                            if mapped_status == DatabaseStatus.FAILED:
+                                logger.warning(
+                                    "opsrequest_successful_but_phase_failed",
+                                    database_id=db.id,
+                                    kubedb_phase=phase,
+                                    message="OpsRequest succeeded but database phase is Failed - keeping UPDATING until database recovers",
+                                )
+                                # Keep UPDATING status - don't change to FAILED
+                            else:
+                                db.status = mapped_status
+                                logger.info(
+                                    "changing_status_from_updating_opsrequest_completed",
+                                    database_id=db.id,
+                                    new_status=mapped_status.value,
+                                    kubedb_phase=phase,
+                                )
                         else:
                             # OpsRequest is still pending/progressing or failed - keep UPDATING
                             logger.debug(
@@ -859,6 +948,41 @@ class DatabaseReconciler:
                 
                 # Safe to update status
                 mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
+
+                # CRITICAL: If database was UPDATING, it should NEVER go to FAILED based on phase alone
+                # The database phase might temporarily become "Failed" during operations (restart, scaling, etc.)
+                # Only OpsRequest failures (handled separately) should set status to FAILED
+                if old_status == DatabaseStatus.UPDATING and mapped_status == DatabaseStatus.FAILED:
+                    logger.warning(
+                        "preventing_updating_to_failed_transition",
+                        database_id=db.id,
+                        old_status=old_status.value,
+                        kubedb_phase=phase,
+                        message="Database was UPDATING but phase is Failed - keeping UPDATING status. Only OpsRequest failures should set to FAILED.",
+                    )
+                    mapped_status = DatabaseStatus.UPDATING
+
+                # Additional safeguard: If phase maps to FAILED, check for active OpsRequests
+                # During operations, the database phase might temporarily become "Failed"
+                # We should not mark database as FAILED if there's an active OpsRequest
+                elif mapped_status == DatabaseStatus.FAILED:
+                    try:
+                        has_any_ops = await self._has_active_ops_request(db, provider_id, kubeconfig_content)
+                        if has_any_ops:
+                            logger.warning(
+                                "database_phase_failed_but_active_ops_exists",
+                                database_id=db.id,
+                                kubedb_phase=phase,
+                                message="Database phase is Failed but active OpsRequest exists - setting to UPDATING instead of FAILED",
+                            )
+                            mapped_status = DatabaseStatus.UPDATING
+                    except Exception as e:
+                        logger.debug(
+                            "failed_to_check_ops_before_failed_status",
+                            database_id=db.id,
+                            error=str(e),
+                        )
+
                 db.status = mapped_status
                 if mapped_status == DatabaseStatus.RUNNING:
                     logger.info(
@@ -939,7 +1063,7 @@ class DatabaseReconciler:
             if not operation_performed:
                 mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
                 # Only update if not in an operation state
-                # IMPORTANT: Don't override RESUMING or PAUSING status here - they're handled above
+                # IMPORTANT: Don't override RESUMING, PAUSING, or FAILED status here - they're handled above
                 if old_status not in [
                     DatabaseStatus.UPDATING,
                     DatabaseStatus.SCALING,
@@ -947,11 +1071,19 @@ class DatabaseReconciler:
                     DatabaseStatus.PAUSED,
                     DatabaseStatus.RESUMING,  # Preserve RESUMING status
                     DatabaseStatus.PAUSING,     # Preserve PAUSING status
+                    DatabaseStatus.FAILED,      # Preserve FAILED status (only change when explicitly resolved above)
                 ]:
                     db.status = mapped_status
-                # If operation completed (status changed from operation state), update ONLY if no active OpsRequest or operation
+                # If operation completed (status changed from operation state), update ONLY if:
+                # 1. No active OpsRequest
+                # 2. No active operation
+                # 3. All replicas are ready (ready_replicas >= desired replicas)
                 elif old_status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING] and mapped_status == DatabaseStatus.RUNNING:
                     # Double-check there's no active OpsRequest or upgrade operation before changing to RUNNING
+                    # Also check if all replicas are ready
+                    current_ready_replicas = db.ready_replicas or 0
+                    all_replicas_ready = current_ready_replicas >= db.replicas
+                    
                     logger.info(
                         "status_sync_operation_completion_check",
                         database_id=db.id,
@@ -959,11 +1091,16 @@ class DatabaseReconciler:
                         mapped_status=mapped_status.value,
                         has_active_ops_request=has_active_ops_request,
                         has_active_operation=bool(active_operation),
+                        ready_replicas=current_ready_replicas,
+                        desired_replicas=db.replicas,
+                        all_replicas_ready=all_replicas_ready,
                     )
-                    if not has_active_ops_request and not active_operation:
+                    if not has_active_ops_request and not active_operation and all_replicas_ready:
                         logger.info(
-                            "changing_status_to_running_no_active_operation",
+                            "changing_status_to_running_no_active_operation_all_replicas_ready",
                             database_id=db.id,
+                            ready_replicas=current_ready_replicas,
+                            desired_replicas=db.replicas,
                         )
                         old_status_value = db.status
                         db.status = mapped_status
@@ -973,11 +1110,17 @@ class DatabaseReconciler:
                         if old_status_value != DatabaseStatus.RUNNING and db.backup_enabled:
                             await self._trigger_initial_backup(db, provider_id, kubeconfig_content)
                     else:
+                        reason = []
+                        if has_active_ops_request:
+                            reason.append("active OpsRequest exists")
+                        if active_operation:
+                            reason.append(f"active operation exists: {str(active_operation.id)}")
+                        if not all_replicas_ready:
+                            reason.append(f"not all replicas ready: {current_ready_replicas}/{db.replicas}")
                         logger.info(
-                            "keeping_updating_status_active_operation_exists",
+                            "keeping_updating_status_conditions_not_met",
                             database_id=db.id,
-                            has_active_ops_request=has_active_ops_request,
-                            operation_id=str(active_operation.id) if active_operation else None,
+                            reason=", ".join(reason),
                         )
             
             # Check OpsRequest status if database is in UPDATING or SCALING state
@@ -1359,7 +1502,10 @@ class DatabaseReconciler:
                         error=str(e),
                     )
                 
-                # Update status to RUNNING if database is ready
+                # Update status to RUNNING ONLY if:
+                # 1. Database is ready
+                # 2. All replicas are up (ready_replicas == desired replicas)
+                # 3. No active OpsRequests exist
                 # Check if database is ready by fetching detailed status
                 try:
                     detailed_status = await kubedb_service.get_detailed_status(
@@ -1371,15 +1517,50 @@ class DatabaseReconciler:
                     )
                     db_is_ready = detailed_status.get("ready", False) if detailed_status else False
                     db_phase = detailed_status.get("phase", "Unknown") if detailed_status else "Unknown"
+                    ready_replicas = detailed_status.get("ready_replicas", 0) if detailed_status else 0
+                    desired_replicas = detailed_status.get("replicas", db.replicas) if detailed_status else db.replicas
                     
-                    # Update status to RUNNING if database is ready and phase is Ready/Running
-                    if db_is_ready and db_phase.lower() in ["ready", "running"] and db.status == DatabaseStatus.UPDATING:
+                    # Check for any active OpsRequests (non-terminal states)
+                    has_active_ops = await self._has_active_ops_request(db, provider_id, kubeconfig_content)
+                    
+                    # Only set to RUNNING if:
+                    # - Database is ready
+                    # - Phase is Ready/Running
+                    # - All replicas are ready (ready_replicas == desired_replicas)
+                    # - No active OpsRequests exist
+                    # - Current status is UPDATING or SCALING
+                    all_replicas_ready = ready_replicas >= desired_replicas
+                    
+                    if (db_is_ready and 
+                        db_phase.lower() in ["ready", "running"] and 
+                        all_replicas_ready and 
+                        not has_active_ops and
+                        db.status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING]):
                         db.status = DatabaseStatus.RUNNING
                         logger.info(
                             "database_status_updated_to_running_after_opsrequest",
                             database_id=db.id,
                             ops_request_name=ops_request_name,
                             phase=db_phase,
+                            ready_replicas=ready_replicas,
+                            desired_replicas=desired_replicas,
+                            has_active_ops=has_active_ops,
+                        )
+                    elif not all_replicas_ready:
+                        logger.info(
+                            "not_setting_to_running_replicas_not_ready",
+                            database_id=db.id,
+                            ready_replicas=ready_replicas,
+                            desired_replicas=desired_replicas,
+                            current_status=db.status.value,
+                            message="Not all replicas are ready - preserving current status",
+                        )
+                    elif has_active_ops:
+                        logger.info(
+                            "not_setting_to_running_active_ops_exists",
+                            database_id=db.id,
+                            current_status=db.status.value,
+                            message="Active OpsRequest exists - preserving current status",
                         )
                 except Exception as e:
                     logger.debug(
@@ -1406,10 +1587,58 @@ class DatabaseReconciler:
                     reason=failure_reason,
                 )
 
-                # Mark database as failed
-                db.status = DatabaseStatus.FAILED
-                db.health_status = f"OpsRequest failed: {failure_reason}"
-                await db.save()
+                # IMPORTANT: During update/scaling operations, don't set status to FAILED
+                # Instead, revert desired state to current state and set status to RUNNING
+                # This keeps the database usable and allows the user to retry
+                if db.status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING]:
+                    logger.warning(
+                        "ops_request_failed_during_update_reverting_to_running",
+                        database_id=db.id,
+                        ops_request_name=ops_request_name,
+                        reason=failure_reason,
+                        message="OpsRequest failed during update/scaling - reverting to RUNNING state instead of FAILED",
+                    )
+                    
+                    # Revert desired state to current state to eliminate drift
+                    # This prevents the reconciler from creating new OpsRequests
+                    # Only revert if current state exists and differs from desired
+                    if db.current_size is not None and db.size != db.current_size:
+                        logger.info(
+                            "reverting_size_to_current_after_opsrequest_failure",
+                            database_id=db.id,
+                            desired_size=db.size.value if db.size else None,
+                            current_size=db.current_size.value if db.current_size else None,
+                        )
+                        db.size = db.current_size
+                    
+                    if db.current_replicas is not None and db.replicas != db.current_replicas:
+                        logger.info(
+                            "reverting_replicas_to_current_after_opsrequest_failure",
+                            database_id=db.id,
+                            desired_replicas=db.replicas,
+                            current_replicas=db.current_replicas,
+                        )
+                        db.replicas = db.current_replicas
+                    
+                    if db.current_storage_gb is not None and db.storage_gb is not None and db.storage_gb != db.current_storage_gb:
+                        logger.info(
+                            "reverting_storage_to_current_after_opsrequest_failure",
+                            database_id=db.id,
+                            desired_storage=db.storage_gb,
+                            current_storage=db.current_storage_gb,
+                        )
+                        db.storage_gb = db.current_storage_gb
+                    
+                    # Set status to RUNNING and log failure in health_status
+                    db.status = DatabaseStatus.RUNNING
+                    db.health_status = f"Last update failed: {failure_reason}. Database is running with previous configuration."
+                    await db.save()
+                else:
+                    # Only set to FAILED if not in UPDATING/SCALING state
+                    # This handles cases where OpsRequest fails for other reasons
+                    db.status = DatabaseStatus.FAILED
+                    db.health_status = f"OpsRequest failed: {failure_reason}"
+                    await db.save()
 
             elif phase in ["Pending", "Progressing"]:
                 # OpsRequest is still in progress
@@ -1626,11 +1855,13 @@ class DatabaseReconciler:
                     # Before setting to RUNNING, check if replicas match (for scaling operations)
                     if db.status in [DatabaseStatus.UPDATING, DatabaseStatus.SCALING]:
                         # Check if ready_replicas matches desired replicas
-                        if ready_replicas < db.replicas:
+                        # Use db.ready_replicas which is updated by status sync service
+                        current_ready_replicas = db.ready_replicas or 0
+                        if current_ready_replicas < db.replicas:
                             logger.info(
                                 "database_still_scaling_replicas",
                                 database_id=db.id,
-                                ready_replicas=ready_replicas,
+                                ready_replicas=current_ready_replicas,
                                 desired_replicas=db.replicas,
                                 message="Preserving UPDATING/SCALING status until all replicas are ready",
                             )

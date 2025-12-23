@@ -1510,6 +1510,10 @@ class DatabaseService:
             created_at=db.created_at,
             updated_at=db.updated_at,
             health_status=db.health_status,
+            upgrade_policy=getattr(db, 'upgrade_policy', None),
+            available_upgrades=getattr(db, 'available_upgrades', []),
+            operation_id=getattr(db, 'operation_id', None),
+            poll_url=getattr(db, 'poll_url', None),
         )
 
     async def refresh_database_endpoint(

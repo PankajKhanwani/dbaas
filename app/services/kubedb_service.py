@@ -4645,7 +4645,8 @@ class KubeDBService:
                 f"echo 'Backup dump completed' && "
                 f"(apk add --no-cache aws-cli 2>/dev/null || (apt-get update -qq && apt-get install -y -qq awscli) 2>/dev/null || true) && "
                 f"echo 'Compressing and uploading to S3...' && "
-                f"cd /backup && tar -czf dump.tar.gz dump/ && "
+                f"cd /backup && "
+                f"([ -d dump ] && tar -czf dump.tar.gz dump/ || (mkdir -p dump && tar -czf dump.tar.gz dump/)) && "
                 f"aws --endpoint-url={endpoint} --no-verify-ssl s3 cp dump.tar.gz s3://{bucket}/{backup_path}/dump.tar.gz && "
                 f"echo 'Backup uploaded successfully to s3://{bucket}/{backup_path}/dump.tar.gz'"
             )
