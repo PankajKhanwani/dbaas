@@ -14,7 +14,7 @@ from app.config.database import Database as DatabaseConnection
 from app.config.logging import get_logger
 from app.models.operation import Operation, OperationType, OperationStatus
 from app.repositories.models import Database
-from app.models.database import DatabaseStatus
+from app.models.database import DatabaseStatus, DatabaseEngine
 from app.services.operation_queue import operation_queue
 from app.services.kubedb_service import kubedb_service
 from app.services.database_service import DatabaseService
@@ -184,14 +184,24 @@ class OperationWorker:
             operation.estimated_completion_at = datetime.now(timezone.utc) + timedelta(minutes=5)
             await operation.save()
 
-            # Set database status to UPDATING
-            db.status = DatabaseStatus.UPDATING
+            # Set status based on operation type
+            # SCALING for scaling operations, UPDATING for other operations
+            if operation.type in [OperationType.SCALE_VERTICAL, OperationType.SCALE_HORIZONTAL]:
+                db.status = DatabaseStatus.SCALING
+                status_message = "Status set to SCALING"
+            else:
+                db.status = DatabaseStatus.UPDATING
+                status_message = "Status set to UPDATING"
+            
             await db.save()
 
             logger.info(
-                "database_status_set_to_updating",
+                "database_status_set",
                 operation_id=operation_id,
                 database_id=db.id,
+                operation_type=operation.type.value,
+                status=db.status.value,
+                message=status_message,
             )
 
             # Process based on type
@@ -297,10 +307,24 @@ class OperationWorker:
                     await operation_queue.requeue_failed(operation_id, priority=10)
                 else:
                     # Update database status
+                    # ABSOLUTE SAFEGUARD: Check if database is actually healthy before setting to FAILED
                     db = await Database.get(operation.database_id)
                     if db:
-                        db.status = DatabaseStatus.FAILED
-                        await db.save()
+                        # Check if database is actually healthy - if so, don't set to FAILED
+                        if db.health_status and db.health_status.lower() in ["ready", "running"]:
+                            logger.warning(
+                                "operation_failed_but_database_healthy_preserving_status",
+                                operation_id=operation_id,
+                                database_id=db.id,
+                                health_status=db.health_status,
+                                message="Operation failed but database is healthy - preserving current status, NOT setting to FAILED",
+                            )
+                            # Don't set to FAILED if database is healthy
+                            # Keep current status (might be RUNNING, SCALING, etc.)
+                        else:
+                            # Database is not healthy - safe to set to FAILED
+                            db.status = DatabaseStatus.FAILED
+                            await db.save()
 
                     # Mark completed (failed) in queue
                     dedup_key = f"{db.id}:{operation.type.value}"
@@ -565,6 +589,74 @@ class OperationWorker:
                             new_version=actual_version,
                             target_version=operation.desired_state.get("target_version"),
                         )
+                        
+                        # FUTURE-PROOF: Ensure replication-password is maintained after upgrade
+                        # This is critical for PostgreSQL HA - upgrades should not break replication
+                        if db.engine == DatabaseEngine.POSTGRES and (db.replicas > 1 or db.high_availability):
+                            try:
+                                # Get current secret to check replication-password
+                                # Use db_service that was already initialized above
+                                client_set = await kubedb_service.get_client_for_provider(provider_id, kubeconfig_content)
+                                
+                                secret_name = f"{db.kubedb_resource_name}-auth"
+                                secret = await client_set.core_api.read_namespaced_secret(
+                                    name=secret_name,
+                                    namespace=db.namespace,
+                                )
+                                
+                                import base64
+                                has_replication_password = "replication-password" in secret.data
+                                current_password = base64.b64decode(secret.data.get("password", "")).decode("utf-8")
+                                current_username = base64.b64decode(secret.data.get("username", "")).decode("utf-8")
+                                
+                                # Ensure replication-password exists and matches password
+                                if not has_replication_password or not current_password:
+                                    logger.warning(
+                                        "replication_password_missing_after_upgrade",
+                                        database_id=db.id,
+                                        message="Replication password missing after upgrade, will restore"
+                                    )
+                                    # Restore replication-password
+                                    patch_data = {
+                                        "replication-password": base64.b64encode(current_password.encode()).decode()
+                                    }
+                                    await client_set.core_api.patch_namespaced_secret(
+                                        name=secret_name,
+                                        namespace=db.namespace,
+                                        body={"data": patch_data},
+                                    )
+                                    logger.info(
+                                        "replication_password_restored_after_upgrade",
+                                        database_id=db.id,
+                                        message="Replication password restored after upgrade"
+                                    )
+                                
+                                # If custom username is set, ensure postgres user password matches
+                                if current_username and current_username != "postgres":
+                                    # Schedule async task to update postgres user password
+                                    asyncio.create_task(
+                                        kubedb_service._ensure_postgres_user_password_for_replication(
+                                            name=db.kubedb_resource_name,
+                                            namespace=db.namespace,
+                                            custom_username=current_username,
+                                            password=current_password,
+                                            provider_id=provider_id,
+                                            kubeconfig_content=kubeconfig_content
+                                        )
+                                    )
+                                    logger.info(
+                                        "postgres_password_update_scheduled_after_upgrade",
+                                        database_id=db.id,
+                                        message="Postgres user password update scheduled after upgrade (transparent to user)"
+                                    )
+                                    
+                            except Exception as repl_error:
+                                logger.warning(
+                                    "failed_to_maintain_replication_after_upgrade",
+                                    database_id=db.id,
+                                    error=str(repl_error)[:200],
+                                    message="Replication password maintenance failed, but upgrade succeeded"
+                                )
                     else:
                         logger.warning(
                             "version_not_found_in_kubedb_resource",
@@ -643,16 +735,59 @@ class OperationWorker:
                     operation.message = "OpsRequest successful"
                     await operation.save()
 
-                    # Update database status
-                    db.status = DatabaseStatus.RUNNING
-                    await db.save()
-
-                    logger.info(
-                        "ops_request_successful",
-                        operation_id=operation.id,
-                        ops_request_name=operation.ops_request_name,
-                        duration=elapsed,
+                    # CRITICAL: Don't set status to RUNNING immediately
+                    # OpsRequest "Successful" doesn't mean pods are ready
+                    # Use comprehensive check to ensure database is truly ready
+                    from app.services.status_sync_service import DatabaseReconciler
+                    reconciler = DatabaseReconciler()
+                    
+                    # Get detailed status for comprehensive check
+                    detailed_status = await kubedb_service.get_detailed_status(
+                        engine=db.engine,
+                        name=db.kubedb_resource_name,
+                        namespace=db.namespace,
+                        provider_id=provider_id,
+                        kubeconfig_content=kubeconfig_content,
                     )
+                    
+                    # Use comprehensive check
+                    truly_ready_result = await reconciler._is_database_truly_ready(
+                        db=db,
+                        detailed_status=detailed_status,
+                        provider_id=provider_id,
+                        kubeconfig_content=kubeconfig_content,
+                    )
+                    
+                    is_truly_ready = truly_ready_result["is_ready"]
+                    reasons = truly_ready_result["reasons"]
+                    checks = truly_ready_result["checks"]
+                    
+                    if is_truly_ready:
+                        db.status = DatabaseStatus.RUNNING
+                        await db.save()
+                        
+                        logger.info(
+                            "ops_request_successful_database_truly_ready",
+                            operation_id=operation.id,
+                            ops_request_name=operation.ops_request_name,
+                            duration=elapsed,
+                            checks=checks,
+                        )
+                    else:
+                        # OpsRequest succeeded but database not truly ready (pods terminating, etc.)
+                        # Keep status as UPDATING - reconciler will update when truly ready
+                        logger.info(
+                            "ops_request_successful_but_database_not_truly_ready",
+                            operation_id=operation.id,
+                            ops_request_name=operation.ops_request_name,
+                            duration=elapsed,
+                            reasons=", ".join(reasons),
+                            checks=checks,
+                            message="OpsRequest succeeded but database not truly ready - keeping UPDATING status",
+                        )
+                        
+                        # Don't return - let it continue to cleanup OpsRequest
+                        # Reconciler will update status when truly ready
 
                     # Clean up: Delete successful OpsRequest
                     try:

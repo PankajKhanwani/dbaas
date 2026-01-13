@@ -206,6 +206,8 @@ class DatabaseResponse(BaseModel):
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
     health_status: Optional[str] = Field(default=None, description="Health status")
+    namespace: Optional[str] = Field(default=None, description="Kubernetes namespace")
+    kubedb_resource_name: Optional[str] = Field(default=None, description="KubeDB resource name")
     upgrade_policy: Optional[UpgradePolicy] = Field(
         default=None, description="Automated version upgrade policy"
     )

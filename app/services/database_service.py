@@ -32,6 +32,7 @@ from app.services.audit_service import audit_service
 from app.services.provider_selector import provider_selector, ProviderSelectionStrategy
 from app.services.resource_allocation import ResourceAllocationService
 from app.core.exceptions import ResourceAllocationError, InvalidProviderError
+from app.utils.namespace import generate_namespace_name
 
 logger = get_logger(__name__)
 
@@ -139,6 +140,7 @@ class DatabaseService:
 
         # PRE-CHECK 3: Select provider (validates resource availability)
         headers = headers or {}
+        
         selected_provider = await provider_selector.select_provider(
             cpu_cores=cpu_cores,
             memory_gb=memory_gb,
@@ -153,21 +155,64 @@ class DatabaseService:
                 f"Region: {headers.get('x-region', 'any')}, AZ: {headers.get('x-availability-zone', 'any')}"
             )
 
-        # PRE-CHECK 4: Validate replicas based on engine
-        # MongoDB replicaset requires minimum 2 replicas for quorum
+        # PRE-CHECK 4: Validate replicas based on HA and engine
         validated_replicas = db_request.replicas
-        if db_request.engine == DatabaseEngine.MONGODB and db_request.replicas < 2:
-            logger.warning(
-                "mongodb_replicas_validation",
-                requested=db_request.replicas,
-                adjusted=2,
-                message="MongoDB replicaset requires minimum 2 replicas, auto-adjusting"
-            )
-            validated_replicas = 2
+        
+        # Rule 1: If HA is enabled, minimum 3 replicas required (odd number)
+        if db_request.high_availability:
+            if db_request.replicas < 3:
+                raise ValueError(
+                    f"High Availability requires minimum 3 replicas. Requested: {db_request.replicas}"
+                )
+            if db_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"High Availability requires odd number of replicas to avoid arbiters. "
+                    f"Requested: {db_request.replicas}. Use 3, 5, 7, etc."
+                )
+        
+        # Rule 2: For non-HA, replicas must be odd (1, 3, 5, 7, etc.) to avoid arbiters
+        if not db_request.high_availability:
+            if db_request.replicas > 1 and db_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"Replicas must be odd number (1, 3, 5, 7, etc.) to avoid arbiters. "
+                    f"Requested: {db_request.replicas}"
+                )
+        
+        # Rule 3: MongoDB replicaset requires minimum 2 replicas for quorum
+        if db_request.engine == DatabaseEngine.MONGODB:
+            if db_request.replicas < 2:
+                logger.warning(
+                    "mongodb_replicas_validation",
+                    requested=db_request.replicas,
+                    adjusted=2,
+                    message="MongoDB replicaset requires minimum 2 replicas, auto-adjusting"
+                )
+                validated_replicas = 2
+            elif db_request.replicas == 2:
+                # MongoDB with 2 replicas is okay (it will add arbiter automatically)
+                validated_replicas = 2
+            elif db_request.replicas > 2 and db_request.replicas % 2 == 0:
+                # MongoDB with even replicas > 2 should be adjusted to next odd
+                validated_replicas = db_request.replicas + 1
+                logger.warning(
+                    "mongodb_replicas_validation",
+                    requested=db_request.replicas,
+                    adjusted=validated_replicas,
+                    message="MongoDB with even replicas will add arbiter. Adjusted to odd number."
+                )
 
         # PRE-CHECK 5: Generate Kubernetes-compliant resource name
         kubedb_name = f"{db_request.name}-{domain}-{project}".lower()
         kubedb_name = kubedb_name[:63].rstrip('-')
+
+        # PRE-CHECK 6: Generate namespace name from domain and project
+        namespace = generate_namespace_name(domain, project)
+        logger.info(
+            "namespace_generated",
+            domain=domain,
+            project=project,
+            namespace=namespace,
+        )
 
         # Create database document (minimal save - status is PENDING)
         db = Database(
@@ -187,7 +232,7 @@ class DatabaseService:
             monitoring_enabled=db_request.monitoring_enabled,
             labels=db_request.labels or {},
             annotations=db_request.annotations or {},
-            namespace=settings.k8s_namespace,
+            namespace=namespace,  # Use domain-project based namespace
             kubedb_resource_name=kubedb_name,
             # Multi-provider fields
             provider_id=selected_provider.id,
@@ -1344,9 +1389,33 @@ class DatabaseService:
                         break
 
                     # If failed, stop monitoring
+                    # ABSOLUTE SAFEGUARD: If database is actually healthy, don't set to FAILED
                     if phase.lower() == "failed":
-                        db.status = DatabaseStatus.FAILED
-                        await db.save()
+                        # Check if database is actually ready (health_status might be Ready even if phase is Failed)
+                        if db.health_status and db.health_status.lower() in ["ready", "running"]:
+                            logger.warning(
+                                "scaling_phase_failed_but_healthy_preserving_scaling",
+                                database_id=db.id,
+                                phase=phase,
+                                health_status=db.health_status,
+                                message="Scaling phase is Failed but database is healthy - preserving SCALING status, NOT setting to FAILED",
+                            )
+                            # Keep SCALING status - don't change to FAILED
+                            await db.save()
+                        else:
+                            # Database is actually not healthy - might be real failure
+                            # But still preserve SCALING if that's the current status
+                            if db.status == DatabaseStatus.SCALING:
+                                logger.warning(
+                                    "scaling_phase_failed_preserving_scaling",
+                                    database_id=db.id,
+                                    phase=phase,
+                                    message="Scaling phase is Failed but preserving SCALING status, NOT setting to FAILED",
+                                )
+                                # Keep SCALING status
+                            else:
+                                db.status = DatabaseStatus.FAILED
+                            await db.save()
                         logger.error("scaling_failed", database_id=db.id, phase=phase)
                         break
 
@@ -1415,7 +1484,42 @@ class DatabaseService:
                 db.ready_replicas = ready_replicas
 
                 # Map KubeDB phase to application status
-                db.status = self._map_kubedb_phase_to_status(phase, is_ready)
+                mapped_status = self._map_kubedb_phase_to_status(phase, is_ready)
+                
+                # CRITICAL: If database is in operation state, NEVER set to FAILED
+                # Updates should NEVER result in FAILED status
+                old_status = db.status
+                if mapped_status == DatabaseStatus.FAILED and old_status in [
+                    DatabaseStatus.UPDATING,
+                    DatabaseStatus.SCALING,
+                    DatabaseStatus.RESUMING,
+                    DatabaseStatus.PAUSING,
+                    DatabaseStatus.PROVISIONING,
+                ]:
+                    logger.warning(
+                        "preventing_failed_status_during_operation_sync",
+                        database_id=db.id,
+                        old_status=old_status.value,
+                        kubedb_phase=phase,
+                        message="Preventing FAILED status during operation in _sync_database_status - preserving operation status",
+                    )
+                    # Keep current operation status
+                    db.status = old_status
+                else:
+                    # ABSOLUTE SAFEGUARD: If health_status is Ready OR phase is Ready, NEVER set to FAILED
+                    if mapped_status == DatabaseStatus.FAILED:
+                        if (db.health_status and db.health_status.lower() in ["ready", "running"]) or phase.lower() in ["ready", "running"]:
+                            logger.error(
+                                "absolute_safeguard_preventing_failed_healthy_database_sync",
+                                database_id=db.id,
+                                old_status=old_status.value,
+                                health_status=db.health_status,
+                                kubedb_phase=phase,
+                                is_ready=is_ready,
+                                message="ABSOLUTE SAFEGUARD in _sync_database_status: Database is healthy - FORCING RUNNING, NOT FAILED",
+                            )
+                            mapped_status = DatabaseStatus.RUNNING
+                    db.status = mapped_status
 
                 # If database is ready, fetch and update endpoint (always refresh to get latest IP)
                 if is_ready:
@@ -1510,6 +1614,8 @@ class DatabaseService:
             created_at=db.created_at,
             updated_at=db.updated_at,
             health_status=db.health_status,
+            namespace=db.namespace,
+            kubedb_resource_name=db.kubedb_resource_name,
             upgrade_policy=getattr(db, 'upgrade_policy', None),
             available_upgrades=getattr(db, 'available_upgrades', []),
             operation_id=getattr(db, 'operation_id', None),

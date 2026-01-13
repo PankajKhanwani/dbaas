@@ -236,7 +236,7 @@ async def update_database(
     - Background worker monitors and updates status back to "RUNNING" when complete
     """
     from app.repositories.models import Database, Provider
-    from app.models.database import DatabaseStatus, DatabaseSize
+    from app.models.database import DatabaseStatus, DatabaseSize, DatabaseEngine
     from app.services.kubedb_service import kubedb_service
     
     # Get database
@@ -256,6 +256,39 @@ async def update_database(
         if update_data.size is not None:
             db.size = update_data.size
         if update_data.replicas is not None:
+            # CRITICAL: Validate replicas - must be odd (except MongoDB which allows 2)
+            # Rule 1: If HA is enabled, minimum 3 replicas required (odd number)
+            if db.high_availability:
+                if update_data.replicas < 3:
+                    raise ValueError(
+                        f"High Availability requires minimum 3 replicas. Requested: {update_data.replicas}"
+                    )
+                if update_data.replicas % 2 == 0:
+                    raise ValueError(
+                        f"High Availability requires odd number of replicas to avoid arbiters. "
+                        f"Requested: {update_data.replicas}. Use 3, 5, 7, etc."
+                    )
+            
+            # Rule 2: For non-HA, replicas must be odd (1, 3, 5, 7, etc.) to avoid arbiters
+            if not db.high_availability:
+                if update_data.replicas > 1 and update_data.replicas % 2 == 0:
+                    raise ValueError(
+                        f"Replicas must be odd number (1, 3, 5, 7, etc.) to avoid arbiters. "
+                        f"Requested: {update_data.replicas}"
+                    )
+            
+            # Rule 3: MongoDB replicaset requires minimum 2 replicas for quorum
+            if db.engine == DatabaseEngine.MONGODB:
+                if update_data.replicas < 2:
+                    raise ValueError(
+                        f"MongoDB replicaset requires minimum 2 replicas. Requested: {update_data.replicas}"
+                    )
+                elif update_data.replicas > 2 and update_data.replicas % 2 == 0:
+                    raise ValueError(
+                        f"MongoDB with even replicas > 2 will add arbiter. Use odd numbers (3, 5, 7, etc.). "
+                        f"Requested: {update_data.replicas}"
+                    )
+            
             db.replicas = update_data.replicas
         if update_data.storage_gb is not None:
             db.storage_gb = update_data.storage_gb
@@ -275,19 +308,30 @@ async def update_database(
     replicas_changed = old_replicas != db.replicas
     storage_changed = old_storage != db.storage_gb
     
-    # If scaling parameters changed, set status to UPDATING immediately and create OpsRequest in background
+    # Determine if this is a scaling operation (size or replicas change)
+    is_scaling = size_changed or replicas_changed
+    
+    # If scaling parameters changed, set appropriate status and create OpsRequest in background
     if size_changed or replicas_changed or storage_changed:
-        # Set status to UPDATING immediately for instant feedback
-        db.status = DatabaseStatus.UPDATING
+        # Set status to SCALING for scaling operations, UPDATING for storage-only changes
+        if is_scaling:
+            db.status = DatabaseStatus.SCALING
+            status_message = "Status set to SCALING immediately - OpsRequest will be created in background"
+        else:
+            db.status = DatabaseStatus.UPDATING
+            status_message = "Status set to UPDATING immediately - OpsRequest will be created in background"
+        
         await db.save()
         
         logger.info(
-            "database_status_set_to_updating_immediate",
+            "database_status_set_immediate",
             database_id=db.id,
+            status=db.status.value,
             size_changed=size_changed,
             replicas_changed=replicas_changed,
             storage_changed=storage_changed,
-            message="Status set to UPDATING immediately - OpsRequest will be created in background",
+            is_scaling=is_scaling,
+            message=status_message,
         )
         
         # Create OpsRequest immediately in background (fire-and-forget)
@@ -523,6 +567,40 @@ async def scale_database(
             "database_id": database_id,
         }
 
+    # CRITICAL: Validate replicas if provided - must be odd (except MongoDB which allows 2)
+    if scale_request and scale_request.replicas is not None:
+        # Rule 1: If HA is enabled, minimum 3 replicas required (odd number)
+        if db.high_availability:
+            if scale_request.replicas < 3:
+                raise ValueError(
+                    f"High Availability requires minimum 3 replicas. Requested: {scale_request.replicas}"
+                )
+            if scale_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"High Availability requires odd number of replicas to avoid arbiters. "
+                    f"Requested: {scale_request.replicas}. Use 3, 5, 7, etc."
+                )
+        
+        # Rule 2: For non-HA, replicas must be odd (1, 3, 5, 7, etc.) to avoid arbiters
+        if not db.high_availability:
+            if scale_request.replicas > 1 and scale_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"Replicas must be odd number (1, 3, 5, 7, etc.) to avoid arbiters. "
+                    f"Requested: {scale_request.replicas}"
+                )
+        
+        # Rule 3: MongoDB replicaset requires minimum 2 replicas for quorum
+        if db.engine == DatabaseEngine.MONGODB:
+            if scale_request.replicas < 2:
+                raise ValueError(
+                    f"MongoDB replicaset requires minimum 2 replicas. Requested: {scale_request.replicas}"
+                )
+            elif scale_request.replicas > 2 and scale_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"MongoDB with even replicas > 2 will add arbiter. Use odd numbers (3, 5, 7, etc.). "
+                    f"Requested: {scale_request.replicas}"
+                )
+
     # Update desired state via service (reconciler will handle OpsRequest creation)
     result = await database_service.scale_database(database_id, scale_request, domain_name, project_name)
     
@@ -538,8 +616,52 @@ async def scale_database(
         details=scale_request.model_dump(exclude_none=True) if scale_request else {},
     )
 
-    # Update database status to UPDATING (reconciler will create OpsRequest)
-    db.status = DatabaseStatus.UPDATING
+    # Reload database to get updated state
+    db = await Database.find_one({"_id": database_id, "domain": domain_name, "project": project_name})
+    
+    # CRITICAL: Validate replicas if provided - must be odd (except MongoDB which allows 2)
+    if scale_request and scale_request.replicas is not None:
+        # Rule 1: If HA is enabled, minimum 3 replicas required (odd number)
+        if db.high_availability:
+            if scale_request.replicas < 3:
+                raise ValueError(
+                    f"High Availability requires minimum 3 replicas. Requested: {scale_request.replicas}"
+                )
+            if scale_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"High Availability requires odd number of replicas to avoid arbiters. "
+                    f"Requested: {scale_request.replicas}. Use 3, 5, 7, etc."
+                )
+        
+        # Rule 2: For non-HA, replicas must be odd (1, 3, 5, 7, etc.) to avoid arbiters
+        if not db.high_availability:
+            if scale_request.replicas > 1 and scale_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"Replicas must be odd number (1, 3, 5, 7, etc.) to avoid arbiters. "
+                    f"Requested: {scale_request.replicas}"
+                )
+        
+        # Rule 3: MongoDB replicaset requires minimum 2 replicas for quorum
+        if db.engine == DatabaseEngine.MONGODB:
+            if scale_request.replicas < 2:
+                raise ValueError(
+                    f"MongoDB replicaset requires minimum 2 replicas. Requested: {scale_request.replicas}"
+                )
+            elif scale_request.replicas > 2 and scale_request.replicas % 2 == 0:
+                raise ValueError(
+                    f"MongoDB with even replicas > 2 will add arbiter. Use odd numbers (3, 5, 7, etc.). "
+                    f"Requested: {scale_request.replicas}"
+                )
+    
+    # Determine if this is a scaling operation (size or replicas change)
+    # scale_request can have size, replicas, or storage_gb
+    is_scaling = (scale_request and scale_request.size is not None) or (scale_request and scale_request.replicas is not None)
+    
+    # Set status to SCALING for scaling operations, UPDATING for storage-only changes
+    if is_scaling:
+        db.status = DatabaseStatus.SCALING
+    else:
+        db.status = DatabaseStatus.UPDATING
     await db.save()
     
     logger.info(

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import './Providers.css'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8003/api/v1'
 
 function Providers({ showNotification }) {
   const [providers, setProviders] = useState([])
