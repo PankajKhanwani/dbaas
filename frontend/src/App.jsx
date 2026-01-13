@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import './App.css'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8003/api/v1'
 const DOMAIN = 'demo'
 const PROJECT = 'demo'
 
@@ -1112,7 +1112,7 @@ function App() {
                           onChange={(e) => setNewDb({ ...newDb, size: e.target.value })}
                           className="select-large"
                         >
-                          <option value="db.t3.micro">💻 Micro - 1 CPU, 1GB RAM</option>
+                          <option value="db.t3.micro">💻 Micro - 0.5 CPU, 1GB RAM</option>
                           <option value="db.t3.small">📊 Small - 1 CPU, 2GB RAM</option>
                           <option value="db.t3.medium">🚀 Medium - 2 CPU, 4GB RAM</option>
                           <option value="db.t3.large">⚡ Large - 2 CPU, 8GB RAM</option>
@@ -1122,34 +1122,132 @@ function App() {
                       <div className="capacity-sliders">
                         <div className="slider-group">
                           <label>
-                            <span>Replicas</span>
-                            <span className="value-badge">{newDb.replicas}</span>
+                            <span>Replicas <span className="required">*</span></span>
+                            {newDb.high_availability && newDb.replicas < 3 && (
+                              <span style={{color: '#ef4444', fontSize: '0.75rem', marginLeft: '0.5rem'}}>
+                                ⚠️ HA requires minimum 3 replicas
+                              </span>
+                            )}
+                            {newDb.high_availability && newDb.replicas >= 3 && newDb.replicas % 2 === 0 && (
+                              <span style={{color: '#ef4444', fontSize: '0.75rem', marginLeft: '0.5rem'}}>
+                                ⚠️ HA requires odd number (3, 5, 7, etc.)
+                              </span>
+                            )}
+                            {!newDb.high_availability && newDb.replicas > 1 && newDb.replicas % 2 === 0 && (
+                              <span style={{color: '#ef4444', fontSize: '0.75rem', marginLeft: '0.5rem'}}>
+                                ⚠️ Use odd numbers (1, 3, 5, 7, etc.) to avoid arbiters
+                              </span>
+                            )}
                             {newDb.engine === 'mongodb' && newDb.replicas < 2 && (
                               <span style={{color: '#ef4444', fontSize: '0.75rem', marginLeft: '0.5rem'}}>
                                 ⚠️ MongoDB requires minimum 2 replicas
                               </span>
                             )}
                           </label>
+                          <div style={{display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '0.5rem'}}>
+                            <input
+                              type="number"
+                              min={newDb.high_availability ? 3 : (newDb.engine === 'mongodb' ? 2 : 1)}
+                              max="10"
+                              step={newDb.high_availability ? 2 : 2}  // Step by 2 to enforce odd numbers
+                              value={(() => {
+                                let val = newDb.replicas
+                                // MongoDB minimum 2
+                                if (newDb.engine === 'mongodb' && val < 2) val = 2
+                                // HA minimum 3 and must be odd
+                                if (newDb.high_availability) {
+                                  if (val < 3) val = 3
+                                  if (val % 2 === 0) val = val + 1  // Make odd
+                                } else {
+                                  // Non-HA: must be odd if > 1
+                                  if (val > 1 && val % 2 === 0) val = val + 1
+                                }
+                                return Math.min(10, val)
+                              })()}
+                              onChange={(e) => {
+                                let replicas = parseInt(e.target.value) || 1
+                                
+                                // MongoDB minimum 2
+                                if (newDb.engine === 'mongodb' && replicas < 2) replicas = 2
+                                
+                                // HA: minimum 3 and must be odd
+                                if (newDb.high_availability) {
+                                  if (replicas < 3) replicas = 3
+                                  if (replicas % 2 === 0) replicas = replicas + 1  // Make odd
+                                } else {
+                                  // Non-HA: must be odd if > 1
+                                  if (replicas > 1 && replicas % 2 === 0) replicas = replicas + 1
+                                }
+                                
+                                setNewDb({ ...newDb, replicas: Math.min(10, Math.max(1, replicas)) })
+                              }}
+                              style={{
+                                width: '80px',
+                                padding: '0.5rem',
+                                borderRadius: '6px',
+                                border: '1px solid #d1d5db',
+                                fontSize: '1rem',
+                                textAlign: 'center'
+                              }}
+                              required
+                            />
+                            <span style={{fontSize: '0.875rem', color: '#6b7280'}}>
+                              {newDb.high_availability 
+                                ? '(HA: 3, 5, 7, 9)' 
+                                : newDb.engine === 'mongodb' 
+                                  ? '(MongoDB: 2, 3, 5, 7, 9)'
+                                  : '(1, 3, 5, 7, 9)'}
+                            </span>
+                          </div>
                           <input
                             type="range"
-                            min={newDb.engine === 'mongodb' ? 2 : 1}
-                            max="5"
-                            value={newDb.engine === 'mongodb' && newDb.replicas < 2 ? 2 : newDb.replicas}
+                            min={newDb.high_availability ? 3 : (newDb.engine === 'mongodb' ? 2 : 1)}
+                            max="9"
+                            step={newDb.high_availability ? 2 : 2}  // Step by 2 for odd numbers
+                            value={(() => {
+                              let val = newDb.replicas
+                              if (newDb.engine === 'mongodb' && val < 2) val = 2
+                              if (newDb.high_availability) {
+                                if (val < 3) val = 3
+                                if (val % 2 === 0) val = val + 1
+                              } else {
+                                if (val > 1 && val % 2 === 0) val = val + 1
+                              }
+                              return Math.min(9, val)
+                            })()}
                             onChange={(e) => {
-                              const replicas = parseInt(e.target.value)
-                              // MongoDB requires minimum 2
-                              const finalReplicas = (newDb.engine === 'mongodb' && replicas < 2) ? 2 : replicas
-                              setNewDb({ ...newDb, replicas: finalReplicas })
+                              let replicas = parseInt(e.target.value)
+                              
+                              if (newDb.engine === 'mongodb' && replicas < 2) replicas = 2
+                              
+                              if (newDb.high_availability) {
+                                if (replicas < 3) replicas = 3
+                                if (replicas % 2 === 0) replicas = replicas + 1
+                              } else {
+                                if (replicas > 1 && replicas % 2 === 0) replicas = replicas + 1
+                              }
+                              
+                              setNewDb({ ...newDb, replicas: Math.min(9, replicas) })
                             }}
                             className="slider"
                           />
                           <div className="slider-labels">
-                            <span>{newDb.engine === 'mongodb' ? 2 : 1}</span>
-                            <span>5</span>
+                            <span>{newDb.high_availability ? 3 : (newDb.engine === 'mongodb' ? 2 : 1)}</span>
+                            <span>9</span>
                           </div>
-                          {newDb.engine === 'mongodb' && (
+                          {newDb.high_availability && (
                             <small style={{color: '#6b7280', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block'}}>
-                              MongoDB replicaset requires minimum 2 replicas for quorum
+                              High Availability requires minimum 3 replicas (odd numbers: 3, 5, 7, 9)
+                            </small>
+                          )}
+                          {!newDb.high_availability && newDb.engine !== 'mongodb' && (
+                            <small style={{color: '#6b7280', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block'}}>
+                              Use odd numbers (1, 3, 5, 7, 9) to avoid arbiters
+                            </small>
+                          )}
+                          {newDb.engine === 'mongodb' && !newDb.high_availability && (
+                            <small style={{color: '#6b7280', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block'}}>
+                              MongoDB: 2 replicas is minimum (will add arbiter). For no arbiter, use 3, 5, 7, 9
                             </small>
                           )}
                         </div>
@@ -1245,7 +1343,22 @@ function App() {
                           <input
                             type="checkbox"
                             checked={newDb.high_availability}
-                            onChange={(e) => setNewDb({ ...newDb, high_availability: e.target.checked })}
+                            onChange={(e) => {
+                              const haEnabled = e.target.checked
+                              let replicas = newDb.replicas
+                              
+                              // If enabling HA, ensure minimum 3 and odd
+                              if (haEnabled) {
+                                if (replicas < 3) replicas = 3
+                                if (replicas % 2 === 0) replicas = replicas + 1
+                              }
+                              // If disabling HA, can go to 1 (but keep odd if > 1)
+                              else {
+                                if (replicas > 1 && replicas % 2 === 0) replicas = replicas - 1
+                              }
+                              
+                              setNewDb({ ...newDb, high_availability: haEnabled, replicas: replicas })
+                            }}
                           />
                           <div className="toggle-content">
                             <div className="toggle-header">

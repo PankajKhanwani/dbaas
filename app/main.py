@@ -314,21 +314,28 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Log all HTTP requests."""
+    import time
+    
+    start_time = time.time()
+    
     logger.info(
         "request_started",
         method=request.method,
         path=request.url.path,
         client=request.client.host if request.client else None,
     )
+    
+    try:
+        response = await call_next(request)
 
-    response = await call_next(request)
-
-    logger.info(
-        "request_completed",
-        method=request.method,
-        path=request.url.path,
-        status_code=response.status_code,
-    )
+        logger.info(
+            "request_completed",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+        )
+    except Exception as e:
+        raise
 
     return response
 

@@ -381,6 +381,8 @@ class KubeDBService:
         namespace: str,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        replicas: Optional[int] = None,
+        high_availability: Optional[bool] = None,
         provider_id: Optional[str] = None,
         kubeconfig_content: Optional[str] = None,
     ) -> None:
@@ -441,6 +443,39 @@ class KubeDBService:
 
                 if password:
                     patch_data["password"] = base64.b64encode(password.encode()).decode()
+                    
+                    # For PostgreSQL with HA (replicas > 1), also set replication-password
+                    # IMPORTANT: KubeDB uses "postgres" user for replication connections
+                    # When custom username is set, we need to ensure "postgres" user also has the correct password
+                    # So replication-password should match the password we're setting
+                    # We'll also need to update postgres user's password in the database
+                    if engine == DatabaseEngine.POSTGRES:
+                        if (replicas and replicas > 1) or (high_availability is True):
+                            # Set replication-password to the same password
+                            # This will be used by "postgres" user for replication
+                            patch_data["replication-password"] = base64.b64encode(password.encode()).decode()
+                            logger.info(
+                                "replication_password_added",
+                                secret_name=secret_name,
+                                namespace=namespace,
+                                message="Added replication-password for PostgreSQL HA setup"
+                            )
+                            
+                            # IMPORTANT: When custom username is provided, KubeDB still uses "postgres" user for replication
+                            # We need to ensure postgres user's password matches replication-password
+                            # This is done automatically in background (transparent to user)
+                            if username and username != "postgres":
+                                # Schedule async task to update postgres user password after DB is ready
+                                asyncio.create_task(
+                                    self._ensure_postgres_user_password_for_replication(
+                                        name=name,
+                                        namespace=namespace,
+                                        custom_username=username,
+                                        password=password,
+                                        provider_id=provider_id,
+                                        kubeconfig_content=kubeconfig_content
+                                    )
+                                )
 
                 if patch_data:
                     await client_set.core_api.patch_namespaced_secret(
@@ -478,6 +513,241 @@ class KubeDBService:
                         error=e.reason,
                     )
                     raise
+
+    async def _ensure_postgres_user_password_for_replication(
+        self,
+        name: str,
+        namespace: str,
+        custom_username: str,
+        password: str,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> None:
+        """
+        Ensure postgres user's password matches replication-password for seamless replication.
+        
+        PRODUCT PERSPECTIVE: This runs automatically in background, completely transparent to user.
+        KubeDB uses "postgres" user for replication, so when custom username is provided,
+        we automatically update postgres user's password to match replication-password.
+        
+        Args:
+            name: Database resource name
+            namespace: Kubernetes namespace
+            custom_username: Custom username that was set
+            password: Password to set for postgres user (same as replication-password)
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+        """
+        import asyncio
+        import subprocess
+        import tempfile
+        import os
+        
+        # Wait for database to be ready (retry up to 5 minutes)
+        max_attempts = 60
+        for attempt in range(max_attempts):
+            try:
+                client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+                
+                # Check if database is ready
+                postgres_resource = await client_set.custom_api.get_namespaced_custom_object(
+                    group="kubedb.com",
+                    version="v1alpha2",
+                    namespace=namespace,
+                    plural="postgreses",
+                    name=name,
+                )
+                
+                phase = postgres_resource.get("status", {}).get("phase")
+                ready_condition = next(
+                    (c for c in postgres_resource.get("status", {}).get("conditions", []) if c.get("type") == "Ready"),
+                    None
+                )
+                accepting_connection_condition = next(
+                    (c for c in postgres_resource.get("status", {}).get("conditions", []) if c.get("type") == "AcceptingConnection"),
+                    None
+                )
+                replica_ready_condition = next(
+                    (c for c in postgres_resource.get("status", {}).get("conditions", []) if c.get("type") == "ReplicaReady"),
+                    None
+                )
+                
+                # CRITICAL FIX: Update postgres password as soon as primary pod is ready (ReplicaReady=True)
+                # This prevents deadlock: standbys can't connect because postgres password is wrong,
+                # but password update was waiting for Ready phase which requires standbys to be connected
+                # Solution: Update password when primary pod is ready, before standbys try to connect
+                is_replicas_ready = (
+                    replica_ready_condition 
+                    and replica_ready_condition.get("status") == "True"
+                )
+                is_accepting_connections = (
+                    accepting_connection_condition 
+                    and accepting_connection_condition.get("status") == "True"
+                )
+                is_ready = phase == "Ready" and ready_condition and ready_condition.get("status") == "True"
+                
+                # Update password when replicas are ready (primary pod is up) OR accepting connections OR ready
+                # This ensures password is updated before standbys try to connect
+                if is_replicas_ready or is_accepting_connections or is_ready:
+                    # Primary pod is ready, update postgres user password immediately
+                    # This allows standbys to connect as soon as they start (before AcceptingConnection becomes True)
+                    try:
+                        # Get primary pod name (usually name-0)
+                        primary_pod = f"{name}-0"
+                        
+                        # Escape password for SQL (replace single quotes)
+                        escaped_password = password.replace("'", "''")
+                        
+                        # Execute ALTER USER command via kubectl exec
+                        # This is transparent to the user - happens automatically in background
+                        kubeconfig_path = None
+                        env = os.environ.copy()
+                        
+                        if kubeconfig_content:
+                            # Write kubeconfig to temp file
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                                import base64
+                                try:
+                                    decoded = base64.b64decode(kubeconfig_content).decode('utf-8')
+                                except:
+                                    # If not base64, use as-is
+                                    decoded = kubeconfig_content
+                                f.write(decoded)
+                                kubeconfig_path = f.name
+                                env["KUBECONFIG"] = kubeconfig_path
+                        
+                        # Build kubectl command
+                        kubectl_cmd = ["kubectl", "exec", "-n", namespace, primary_pod, "-c", "postgres", "--"]
+                        
+                        # CRITICAL FIX: Use -h localhost to force TCP connection instead of Unix socket
+                        # When using kubectl exec, Unix socket may not be available
+                        # Using -h localhost ensures TCP connection works reliably
+                        psql_cmd = [
+                            "psql", "-h", "localhost", "-U", custom_username, "-d", "postgres", "-c",
+                            f"ALTER USER postgres WITH PASSWORD '{escaped_password}';"
+                        ]
+                        
+                        full_cmd = kubectl_cmd + psql_cmd
+                        
+                        # Execute command
+                        result = subprocess.run(
+                            full_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env=env
+                        )
+                        
+                        if result.returncode == 0:
+                            logger.info(
+                                "postgres_user_password_updated_for_replication",
+                                database_name=name,
+                                namespace=namespace,
+                                message="Updated postgres user password for seamless replication (transparent to user)"
+                            )
+                            # Cleanup temp kubeconfig file
+                            if kubeconfig_path and os.path.exists(kubeconfig_path):
+                                try:
+                                    os.unlink(kubeconfig_path)
+                                except:
+                                    pass
+                            return
+                        else:
+                            logger.warning(
+                                "postgres_password_update_failed",
+                                database_name=name,
+                                namespace=namespace,
+                                error=result.stderr[:200] if result.stderr else "Unknown error",
+                                stdout=result.stdout[:200] if result.stdout else None,
+                                returncode=result.returncode,
+                                attempt=attempt + 1,
+                                message="Will retry on next attempt"
+                            )
+                            # Cleanup temp kubeconfig file
+                            if kubeconfig_path and os.path.exists(kubeconfig_path):
+                                try:
+                                    os.unlink(kubeconfig_path)
+                                except:
+                                    pass
+                            if attempt < max_attempts - 1:
+                                await asyncio.sleep(10)
+                                continue
+                        
+                    except subprocess.TimeoutExpired:
+                        logger.warning(
+                            "postgres_password_update_timeout",
+                            database_name=name,
+                            namespace=namespace,
+                            attempt=attempt + 1,
+                            message="Command timed out, will retry"
+                        )
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(10)
+                            continue
+                    except Exception as db_error:
+                        logger.warning(
+                            "failed_to_update_postgres_password",
+                            database_name=name,
+                            namespace=namespace,
+                            attempt=attempt + 1,
+                            error=str(db_error)[:200],
+                            message="Will retry on next attempt"
+                        )
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(10)
+                            continue
+                        else:
+                            logger.error(
+                                "failed_to_update_postgres_password_after_retries",
+                                database_name=name,
+                                namespace=namespace,
+                                error=str(db_error)[:200],
+                            )
+                            return
+                else:
+                    # Database not ready yet, wait and retry
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        logger.warning(
+                            "database_not_ready_for_password_update",
+                            database_name=name,
+                            namespace=namespace,
+                            message="Database did not become ready within timeout, postgres password update skipped"
+                        )
+                        return
+                        
+            except ApiException as e:
+                if e.status == 404:
+                    # Resource not found, wait and retry
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        logger.warning(
+                            "postgres_resource_not_found",
+                            database_name=name,
+                            namespace=namespace,
+                            message="PostgreSQL resource not found, password update skipped"
+                        )
+                        return
+                else:
+                    logger.error(
+                        "failed_to_check_postgres_status",
+                        database_name=name,
+                        namespace=namespace,
+                        error=str(e),
+                    )
+                    return
+            except Exception as e:
+                logger.error(
+                    "unexpected_error_updating_postgres_password",
+                    database_name=name,
+                    namespace=namespace,
+                    error=str(e)[:200],
+                )
+                return
 
     def _get_kubedb_group(self, engine: DatabaseEngine) -> str:
         """Get KubeDB API group for database engine."""
@@ -923,6 +1193,124 @@ class KubeDBService:
 
         return spec
 
+    async def ensure_namespace(
+        self,
+        namespace: str,
+        labels: Optional[Dict[str, str]] = None,
+        annotations: Optional[Dict[str, str]] = None,
+        provider_id: Optional[str] = None,
+        kubeconfig_content: Optional[str] = None,
+    ) -> None:
+        """
+        Ensure a Kubernetes namespace exists. Create it if it doesn't exist.
+        
+        Args:
+            namespace: Namespace name
+            labels: Optional labels to add to namespace
+            annotations: Optional annotations to add to namespace
+            provider_id: Provider ID for multi-cluster support
+            kubeconfig_content: Provider's kubeconfig content
+            
+        Raises:
+            KubernetesError: If namespace creation fails
+        """
+        client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+        
+        try:
+            # Try to read the namespace first
+            try:
+                existing = await client_set.core_api.read_namespace(name=namespace)
+                logger.info(
+                    "namespace_exists",
+                    namespace=namespace,
+                    provider_id=provider_id,
+                )
+                # Update labels/annotations if provided and different
+                if labels or annotations:
+                    metadata = existing.metadata
+                    updated = False
+                    
+                    if labels:
+                        if not metadata.labels:
+                            metadata.labels = {}
+                        for key, value in labels.items():
+                            if metadata.labels.get(key) != value:
+                                metadata.labels[key] = value
+                                updated = True
+                    
+                    if annotations:
+                        if not metadata.annotations:
+                            metadata.annotations = {}
+                        for key, value in annotations.items():
+                            if metadata.annotations.get(key) != value:
+                                metadata.annotations[key] = value
+                                updated = True
+                    
+                    if updated:
+                        await client_set.core_api.patch_namespace(
+                            name=namespace,
+                            body={"metadata": {"labels": metadata.labels, "annotations": metadata.annotations}}
+                        )
+                        logger.info(
+                            "namespace_updated",
+                            namespace=namespace,
+                            provider_id=provider_id,
+                        )
+                return
+            except ApiException as e:
+                if e.status != 404:
+                    # Some other error, re-raise
+                    raise
+        
+        except Exception as e:
+            logger.warning(
+                "namespace_read_failed",
+                namespace=namespace,
+                provider_id=provider_id,
+                error=str(e),
+            )
+            # Continue to create
+        
+        # Namespace doesn't exist, create it
+        try:
+            namespace_body = {
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": namespace,
+                    "labels": labels or {},
+                    "annotations": annotations or {},
+                },
+            }
+            
+            await client_set.core_api.create_namespace(body=namespace_body)
+            logger.info(
+                "namespace_created",
+                namespace=namespace,
+                provider_id=provider_id,
+                labels=labels,
+                annotations=annotations,
+            )
+        except ApiException as e:
+            if e.status == 409:
+                # Namespace was created by another process, that's fine
+                logger.info(
+                    "namespace_already_exists",
+                    namespace=namespace,
+                    provider_id=provider_id,
+                )
+            else:
+                logger.error(
+                    "namespace_creation_failed",
+                    namespace=namespace,
+                    provider_id=provider_id,
+                    error=str(e),
+                    status=e.status,
+                )
+                raise KubernetesError(
+                    f"Failed to create namespace '{namespace}': {str(e)}"
+                )
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -1043,6 +1431,17 @@ class KubeDBService:
                 }
             }
 
+        # Ensure namespace exists before creating database
+        namespace_labels = labels or {}
+        namespace_annotations = annotations or {}
+        await self.ensure_namespace(
+            namespace=namespace,
+            labels=namespace_labels,
+            annotations=namespace_annotations,
+            provider_id=provider_id,
+            kubeconfig_content=kubeconfig_content,
+        )
+
         # Build custom resource
         body = {
             "apiVersion": f"{self._get_kubedb_group(engine)}/{self._get_kubedb_version(engine)}",
@@ -1090,7 +1489,10 @@ class KubeDBService:
                     namespace=namespace,
                     username=username,
                     password=password,
-                    provider_id=provider_id
+                    replicas=replicas,
+                    high_availability=high_availability,
+                    provider_id=provider_id,
+                    kubeconfig_content=kubeconfig_content
                 )
 
             return result
@@ -1179,7 +1581,66 @@ class KubeDBService:
             )
 
             # Step 1: Delete the KubeDB CRD
+            # For stuck databases (stuck in Provisioning), we may need to remove finalizers first
             try:
+                # Check if resource exists and get its current state
+                try:
+                    resource = await client_set.custom_api.get_namespaced_custom_object(
+                        group=self._get_kubedb_group(engine),
+                        version=self._get_kubedb_version(engine),
+                        namespace=namespace,
+                        plural=self._get_kubedb_plural(engine),
+                        name=name,
+                    )
+                    
+                    # If resource is stuck (e.g., Provisioning for too long), remove finalizers to force delete
+                    phase = resource.get("status", {}).get("phase", "")
+                    finalizers = resource.get("metadata", {}).get("finalizers", [])
+                    
+                    # If stuck in Provisioning and has finalizers, remove them to allow deletion
+                    if phase == "Provisioning" and finalizers:
+                        logger.warning(
+                            "database_stuck_in_provisioning_removing_finalizers",
+                            name=name,
+                            namespace=namespace,
+                            phase=phase,
+                            finalizers=finalizers,
+                            message="Database stuck in Provisioning, removing finalizers to allow deletion"
+                        )
+                        # Remove finalizers by patching
+                        patch_body = {
+                            "metadata": {
+                                "finalizers": []
+                            }
+                        }
+                        await client_set.custom_api.patch_namespaced_custom_object(
+                            group=self._get_kubedb_group(engine),
+                            version=self._get_kubedb_version(engine),
+                            namespace=namespace,
+                            plural=self._get_kubedb_plural(engine),
+                            name=name,
+                            body=patch_body,
+                            _content_type="application/merge-patch+json",
+                        )
+                        logger.info(
+                            "finalizers_removed_for_stuck_database",
+                            name=name,
+                            namespace=namespace,
+                            message="Finalizers removed, proceeding with deletion"
+                        )
+                        # Wait a moment for the patch to take effect
+                        await asyncio.sleep(1)
+                        
+                except ApiException as get_error:
+                    if get_error.status != 404:
+                        logger.warning(
+                            "failed_to_check_resource_before_delete",
+                            name=name,
+                            error=str(get_error),
+                            message="Will attempt deletion anyway"
+                        )
+                
+                # Now delete the resource
                 await client_set.custom_api.delete_namespaced_custom_object(
                     group=self._get_kubedb_group(engine),
                     version=self._get_kubedb_version(engine),
@@ -1397,46 +1858,98 @@ class KubeDBService:
         # Get replica counts
         desired_replicas = spec.get("replicas", 1)
 
-        # Try multiple field names for ready replicas (different engines use different names)
-        ready_replicas = status.get("readyReplicas") or status.get("replicas")
-
-        # If not in KubeDB status, check the PetSet (KubeDB's StatefulSet replacement)
-        if ready_replicas is None:
-            try:
-                client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
-                # Query PetSet (KubeDB's custom resource for managing pods)
-                petset = await client_set.custom_api.get_namespaced_custom_object(
-                    group="apps.k8s.appscode.com",
-                    version="v1",
-                    namespace=namespace,
-                    plural="petsets",
-                    name=name
-                )
-                ready_replicas = petset.get("status", {}).get("readyReplicas", 0)
-                logger.info(
-                    "replica_count_from_petset",
-                    name=name,
-                    desired=petset.get("spec", {}).get("replicas", 1),
-                    ready=ready_replicas,
-                )
-            except Exception as e:
-                # 404 is expected for new/deleted databases - PetSet may not exist yet
-                error_str = str(e)
-                if "404" in error_str or "Not Found" in error_str:
-                    logger.debug(
-                        "petset_not_found",
-                        name=name,
-                        message="PetSet not created yet or already deleted",
+        # CRITICAL: Count actual running pods (excluding terminating ones)
+        # K8s readyReplicas includes terminating pods, which is misleading
+        # We need to count only pods that are Running AND not terminating
+        ready_replicas = 0
+        try:
+            client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+            label_selector = f"app.kubernetes.io/instance={name}"
+            pods = await client_set.core_api.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=label_selector
+            )
+            
+            # Count only pods that are:
+            # 1. In Running phase
+            # 2. Not terminating (no deletionTimestamp)
+            # 3. All containers ready
+            for pod in pods.items:
+                pod_phase = pod.status.phase
+                deletion_timestamp = pod.metadata.deletion_timestamp
+                
+                # Skip terminating pods
+                if deletion_timestamp is not None:
+                    continue
+                
+                # Count only Running pods with all containers ready
+                if pod_phase == "Running":
+                    # Check if all containers are ready
+                    container_statuses = pod.status.container_statuses or []
+                    all_ready = all(
+                        container.ready for container in container_statuses
+                    ) if container_statuses else False
+                    
+                    if all_ready:
+                        ready_replicas += 1
+            
+            logger.debug(
+                "ready_replicas_calculated_from_pods",
+                name=name,
+                namespace=namespace,
+                ready_replicas=ready_replicas,
+                desired_replicas=desired_replicas,
+                message="Counted actual running pods (excluding terminating)",
+            )
+            
+        except Exception as e:
+            # Fallback to K8s status if pod counting fails
+            logger.warning(
+                "failed_to_count_pods_fallback_to_k8s_status",
+                name=name,
+                namespace=namespace,
+                error=str(e)[:200],
+            )
+            # Try multiple field names for ready replicas (different engines use different names)
+            ready_replicas = status.get("readyReplicas") or status.get("replicas")
+            
+            # If not in KubeDB status, check the PetSet (KubeDB's StatefulSet replacement)
+            if ready_replicas is None:
+                try:
+                    client_set = await self.get_client_for_provider(provider_id, kubeconfig_content)
+                    # Query PetSet (KubeDB's custom resource for managing pods)
+                    petset = await client_set.custom_api.get_namespaced_custom_object(
+                        group="apps.k8s.appscode.com",
+                        version="v1",
+                        namespace=namespace,
+                        plural="petsets",
+                        name=name
                     )
-                else:
-                    logger.warning(
-                        "failed_to_get_petset_replicas",
+                    ready_replicas = petset.get("status", {}).get("readyReplicas", 0)
+                    logger.info(
+                        "replica_count_from_petset",
                         name=name,
-                        error=error_str,
+                        desired=petset.get("spec", {}).get("replicas", 1),
+                        ready=ready_replicas,
                     )
-                ready_replicas = 0
-        else:
-            ready_replicas = int(ready_replicas)
+                except Exception as e2:
+                    # 404 is expected for new/deleted databases - PetSet may not exist yet
+                    error_str = str(e2)
+                    if "404" in error_str or "Not Found" in error_str:
+                        logger.debug(
+                            "petset_not_found",
+                            name=name,
+                            message="PetSet not created yet or already deleted",
+                        )
+                    else:
+                        logger.warning(
+                            "failed_to_get_petset_replicas",
+                            name=name,
+                            error=error_str,
+                        )
+                    ready_replicas = 0
+            else:
+                ready_replicas = int(ready_replicas)
 
         # Get recent events for better error visibility
         events = await self._get_resource_events(name, namespace, provider_id=provider_id)
