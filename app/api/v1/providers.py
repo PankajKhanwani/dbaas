@@ -25,6 +25,7 @@ from app.services.kubedb_service import kubedb_service
 from app.models.database import DatabaseEngine
 
 router = APIRouter()
+domain_router = APIRouter()  # Domain-scoped provider routes (mounted under /api/v1/domain/{domain_name}/providers)
 logger = get_logger(__name__)
 
 
@@ -36,6 +37,7 @@ def _build_provider_response(provider) -> ProviderResponse:
         region=provider.region,
         availability_zone=provider.availability_zone,
         cloud_provider=provider.cloud_provider,
+        domain=provider.domain,
         resources=ProviderResources(
             cpu=ResourceInfo(
                 total_cores=provider.cpu_total_cores,
@@ -606,4 +608,136 @@ async def get_available_versions(
             "engine": engine,
             "versions": [],
             "error": f"Failed to fetch versions: {str(e)}"
+        }
+
+
+# ---------------------------------------------------------------------------
+# Domain-scoped provider routes
+# Mounted at: /api/v1/domain/{domain_name}/providers
+# ---------------------------------------------------------------------------
+
+@domain_router.get("/engines")
+async def get_domain_engines(
+    domain_name: str = Path(..., description="Tenant domain name"),
+    region: Optional[str] = Query(None, description="Filter by region"),
+    availability_zone: Optional[str] = Query(None, description="Filter by AZ"),
+):
+    """
+    Get available database engines and versions for a specific domain.
+
+    Resolves the provider to use based on domain binding:
+    1. If a dedicated provider exists for this domain → use it.
+    2. Otherwise fall back to shared providers (no domain binding).
+
+    Region/AZ filters are applied on top of the domain lookup.
+
+    **URL:** /api/v1/domain/{domain_name}/providers/engines
+    """
+    try:
+        # Phase 1: Look for a dedicated provider for this domain
+        dedicated_providers = await provider_service.list_providers(
+            domain=domain_name,
+            region=region,
+            availability_zone=availability_zone,
+            is_active=True,
+            skip=0,
+            limit=1,
+        )
+
+        if dedicated_providers:
+            provider = dedicated_providers[0]
+            logger.info(
+                "using_dedicated_provider_for_engines",
+                domain=domain_name,
+                provider_id=provider.id,
+                provider_name=provider.name,
+            )
+        else:
+            # Phase 2: Fall back to shared providers (domain=None)
+            shared_providers = await provider_service.list_providers(
+                domain=None,
+                region=region,
+                availability_zone=availability_zone,
+                is_active=True,
+                skip=0,
+                limit=1,
+            )
+
+            if not shared_providers:
+                logger.warning(
+                    "no_providers_found_for_domain",
+                    domain=domain_name,
+                    region=region,
+                    az=availability_zone,
+                )
+                return {
+                    "engines": {},
+                    "error": "No versions found"
+                }
+
+            provider = shared_providers[0]
+            logger.info(
+                "using_shared_provider_for_engines",
+                domain=domain_name,
+                provider_id=provider.id,
+                provider_name=provider.name,
+            )
+
+        logger.info(
+            "fetching_all_engines_from_provider",
+            domain=domain_name,
+            provider_id=provider.id,
+            provider_name=provider.name,
+            region=provider.region,
+        )
+
+        # Fetch versions for all supported engines
+        engines = {}
+        for engine in DatabaseEngine:
+            try:
+                result = await kubedb_service.get_available_versions(
+                    engine=engine,
+                    provider_id=provider.id,
+                )
+
+                if result.get("versions"):
+                    engines[engine.value] = result.get("versions", [])
+
+            except Exception as e:
+                logger.error(
+                    "failed_to_fetch_engine_versions",
+                    engine=engine.value,
+                    error=str(e),
+                    exc_info=True,
+                )
+                continue
+
+        logger.info(
+            "fetched_all_engines_for_domain",
+            domain=domain_name,
+            provider_id=provider.id,
+            engines_count=len(engines),
+            engines=list(engines.keys()),
+        )
+
+        return {
+            "domain": domain_name,
+            "region": provider.region,
+            "availability_zone": provider.availability_zone,
+            "provider_id": provider.id,
+            "provider_name": provider.name,
+            "provider_domain": provider.domain,
+            "engines": engines,
+        }
+
+    except Exception as e:
+        logger.error(
+            "failed_to_fetch_engines_for_domain",
+            domain=domain_name,
+            error=str(e),
+            exc_info=True,
+        )
+        return {
+            "engines": {},
+            "error": f"Failed to fetch engines: {str(e)}"
         }

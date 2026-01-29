@@ -8,6 +8,7 @@ import asyncio
 import base64
 import re
 import tempfile
+import uuid
 import yaml
 from typing import Dict, Any, Optional, List
 from kubernetes_asyncio import client, config
@@ -904,9 +905,12 @@ class KubeDBService:
         }
 
         if high_availability:
+            # MySQL Group Replication requires a valid UUID for group name
+            # Use uuid5 (deterministic) so the same database name always gets the same UUID
+            group_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"mysql-group-{name}"))
             spec["topology"] = {
                 "mode": "GroupReplication",
-                "group": {"name": f"{name}-group"},
+                "group": {"name": group_uuid},
             }
 
         return spec
@@ -950,9 +954,12 @@ class KubeDBService:
 
         # MariaDB Galera cluster for high availability
         if high_availability and replicas >= 3:
+            # MariaDB Group Replication requires a valid UUID for group name
+            # Use uuid5 (deterministic) so the same database name always gets the same UUID
+            group_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"mariadb-group-{name}"))
             spec["topology"] = {
                 "mode": "GroupReplication",
-                "group": {"name": f"{name}-group"},
+                "group": {"name": group_uuid},
             }
 
         return spec

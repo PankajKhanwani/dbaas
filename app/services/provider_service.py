@@ -11,6 +11,9 @@ from app.core.exceptions import ProviderNotFoundError, InvalidProviderError
 
 logger = structlog.get_logger()
 
+# Sentinel value to distinguish "no domain filter" from "filter for domain=None (shared providers)"
+_DOMAIN_UNSET = object()
+
 
 async def _validate_kubernetes_connection(
     kubeconfig_content: Optional[str],
@@ -164,6 +167,7 @@ class ProviderService:
         region: Optional[str] = None,
         availability_zone: Optional[str] = None,
         is_active: Optional[bool] = None,
+        domain=_DOMAIN_UNSET,
         skip: int = 0,
         limit: int = 100,
     ) -> List[Provider]:
@@ -174,6 +178,10 @@ class ProviderService:
             region: Filter by region
             availability_zone: Filter by AZ
             is_active: Filter by active status
+            domain: Filter by dedicated domain.
+                - _DOMAIN_UNSET (default): no domain filter, returns all providers
+                - A string value: returns only providers dedicated to that domain
+                - None: returns only shared providers (domain is not set)
             skip: Number of records to skip
             limit: Maximum number of records to return
 
@@ -188,6 +196,9 @@ class ProviderService:
             query = query.find(Provider.availability_zone == availability_zone)
         if is_active is not None:
             query = query.find(Provider.is_active == is_active)
+        if domain is not _DOMAIN_UNSET:
+            # domain=None means "shared providers only", domain="acme" means "dedicated to acme"
+            query = query.find(Provider.domain == domain)
 
         providers = await query.skip(skip).limit(limit).to_list()
         return providers
