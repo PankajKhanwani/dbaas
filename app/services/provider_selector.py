@@ -13,6 +13,31 @@ from app.repositories.models import Provider
 logger = structlog.get_logger()
 
 
+def _availability_score(provider: Provider, cpu_cores: float, memory_gb: float, storage_gb: float) -> float:
+    """
+    Compute a normalized availability score for a provider.
+
+    Score = min(avail_cpu / req_cpu, avail_mem / req_mem, avail_storage / req_storage)
+
+    This represents the minimum "headroom multiplier" across all resource dimensions.
+    A score of 2.0 means the provider can serve this request twice over on every dimension.
+    Higher is better — indicates more available capacity relative to the request.
+    """
+    avail_cpu = provider.get_available_cpu()
+    avail_mem = provider.get_available_memory()
+    avail_storage = provider.get_available_storage()
+
+    # Avoid division by zero (should not happen due to can_accommodate guard, but defensive)
+    if cpu_cores <= 0 or memory_gb <= 0 or storage_gb <= 0:
+        return 0.0
+
+    return min(
+        avail_cpu / cpu_cores,
+        avail_mem / memory_gb,
+        avail_storage / storage_gb,
+    )
+
+
 class ProviderSelectionStrategy(ABC):
     """
     Abstract base class for provider selection strategies.
@@ -27,6 +52,7 @@ class ProviderSelectionStrategy(ABC):
         memory_gb: float,
         storage_gb: float,
         headers: Dict[str, str],
+        domain: Optional[str] = None,
         **kwargs
     ) -> Optional[Provider]:
         """
@@ -37,12 +63,167 @@ class ProviderSelectionStrategy(ABC):
             memory_gb: Required memory in GB
             storage_gb: Required storage in GB
             headers: Request headers containing az, region, etc.
+            domain: Tenant domain for the database being created
             **kwargs: Additional criteria
 
         Returns:
             Selected Provider or None if no suitable provider found
         """
         pass
+
+
+class DedicatedProviderStrategy(ProviderSelectionStrategy):
+    """
+    Strategy that prioritizes dedicated (domain-bound) providers.
+
+    Behavior:
+    - Phase 1: Look for providers dedicated to the requesting domain (provider.domain == domain).
+      Among those, pick the one with the highest availability score.
+      If dedicated providers exist but none can accommodate → ERROR (raise, no fallback).
+    - Phase 2 (fallback): If NO dedicated providers exist for this domain at all,
+      fall back to shared providers (provider.domain is None).
+      Among shared providers, pick the one with the highest availability score.
+
+    Availability Score: min(avail_cpu/req_cpu, avail_mem/req_mem, avail_storage/req_storage)
+    Higher score = more headroom = preferred.
+
+    Region/AZ headers are applied as additional filters in both phases.
+    """
+
+    async def select_provider(
+        self,
+        cpu_cores: float,
+        memory_gb: float,
+        storage_gb: float,
+        headers: Dict[str, str],
+        domain: Optional[str] = None,
+        **kwargs
+    ) -> Optional[Provider]:
+        region = headers.get("x-region") or headers.get("X-Region")
+        az = headers.get("x-availability-zone") or headers.get("X-Availability-Zone")
+
+        logger.info(
+            "dedicated_provider_selection",
+            domain=domain,
+            region=region,
+            az=az,
+            cpu=cpu_cores,
+            memory=memory_gb,
+            storage=storage_gb,
+        )
+
+        # --- Phase 1: Dedicated providers for this domain ---
+        if domain:
+            dedicated_providers = await self._query_providers(
+                domain=domain, region=region, az=az
+            )
+
+            if dedicated_providers:
+                # Dedicated providers exist — MUST use one of them
+                candidate = self._pick_best(dedicated_providers, cpu_cores, memory_gb, storage_gb)
+
+                if candidate:
+                    logger.info(
+                        "dedicated_provider_selected",
+                        provider_id=candidate.id,
+                        provider_name=candidate.name,
+                        domain=domain,
+                        score=_availability_score(candidate, cpu_cores, memory_gb, storage_gb),
+                    )
+                    return candidate
+
+                # Dedicated providers exist but none can accommodate → error out
+                logger.warning(
+                    "dedicated_providers_at_capacity",
+                    domain=domain,
+                    dedicated_count=len(dedicated_providers),
+                    cpu=cpu_cores,
+                    memory=memory_gb,
+                    storage=storage_gb,
+                )
+                return None  # Caller (database_service) will raise ResourceAllocationError
+
+        # --- Phase 2: Fall back to shared providers (domain=None) ---
+        logger.info(
+            "falling_back_to_shared_providers",
+            domain=domain,
+            reason="No dedicated providers found for this domain",
+        )
+
+        shared_providers = await self._query_providers(
+            domain=None, region=region, az=az
+        )
+
+        candidate = self._pick_best(shared_providers, cpu_cores, memory_gb, storage_gb)
+
+        if candidate:
+            logger.info(
+                "shared_provider_selected",
+                provider_id=candidate.id,
+                provider_name=candidate.name,
+                score=_availability_score(candidate, cpu_cores, memory_gb, storage_gb),
+            )
+            return candidate
+
+        logger.warning(
+            "no_provider_found",
+            domain=domain,
+            region=region,
+            az=az,
+            cpu=cpu_cores,
+            memory=memory_gb,
+            storage=storage_gb,
+        )
+        return None
+
+    async def _query_providers(
+        self,
+        domain: Optional[str],
+        region: Optional[str],
+        az: Optional[str],
+    ) -> List[Provider]:
+        """Query providers filtered by domain, region, and AZ."""
+        query = Provider.find(
+            Provider.is_active == True,
+            Provider.is_maintenance == False,
+        )
+
+        # Domain filter: exact match for dedicated, explicit None for shared
+        if domain is not None:
+            query = query.find(Provider.domain == domain)
+        else:
+            query = query.find(Provider.domain == None)  # noqa: E711
+
+        if region:
+            query = query.find(Provider.region == region)
+        if az:
+            query = query.find(Provider.availability_zone == az)
+
+        return await query.to_list()
+
+    def _pick_best(
+        self,
+        providers: List[Provider],
+        cpu_cores: float,
+        memory_gb: float,
+        storage_gb: float,
+    ) -> Optional[Provider]:
+        """
+        Among providers that can accommodate the request, pick the one
+        with the highest normalized availability score.
+        """
+        candidates = []
+        for provider in providers:
+            if provider.can_accommodate(cpu_cores, memory_gb, storage_gb):
+                score = _availability_score(provider, cpu_cores, memory_gb, storage_gb)
+                candidates.append((provider, score))
+
+        if not candidates:
+            return None
+
+        # Sort descending by score, then by priority as tiebreaker
+        candidates.sort(key=lambda x: (x[1], x[0].priority), reverse=True)
+        return candidates[0][0]
 
 
 class RegionAZStrategy(ProviderSelectionStrategy):
@@ -60,6 +241,7 @@ class RegionAZStrategy(ProviderSelectionStrategy):
         memory_gb: float,
         storage_gb: float,
         headers: Dict[str, str],
+        domain: Optional[str] = None,
         **kwargs
     ) -> Optional[Provider]:
         """Select provider based on region and AZ from headers."""
@@ -126,6 +308,7 @@ class BestFitStrategy(ProviderSelectionStrategy):
         memory_gb: float,
         storage_gb: float,
         headers: Dict[str, str],
+        domain: Optional[str] = None,
         **kwargs
     ) -> Optional[Provider]:
         """Select provider with best resource fit."""
@@ -194,6 +377,7 @@ class RoundRobinStrategy(ProviderSelectionStrategy):
         memory_gb: float,
         storage_gb: float,
         headers: Dict[str, str],
+        domain: Optional[str] = None,
         **kwargs
     ) -> Optional[Provider]:
         """Select provider in round-robin fashion."""
@@ -233,8 +417,8 @@ class ProviderSelector:
     Provider Selector with pluggable strategies.
 
     Usage:
-        selector = ProviderSelector(strategy=RegionAZStrategy())
-        provider = await selector.select_provider(cpu, memory, storage, headers)
+        selector = ProviderSelector(strategy=DedicatedProviderStrategy())
+        provider = await selector.select_provider(cpu, memory, storage, headers, domain=domain)
     """
 
     def __init__(self, strategy: Optional[ProviderSelectionStrategy] = None):
@@ -242,9 +426,9 @@ class ProviderSelector:
         Initialize with a strategy.
 
         Args:
-            strategy: Provider selection strategy (defaults to RegionAZStrategy)
+            strategy: Provider selection strategy (defaults to DedicatedProviderStrategy)
         """
-        self.strategy = strategy or RegionAZStrategy()
+        self.strategy = strategy or DedicatedProviderStrategy()
 
     def set_strategy(self, strategy: ProviderSelectionStrategy):
         """Change the selection strategy at runtime."""
@@ -256,6 +440,7 @@ class ProviderSelector:
         memory_gb: float,
         storage_gb: float,
         headers: Dict[str, str],
+        domain: Optional[str] = None,
         **kwargs
     ) -> Optional[Provider]:
         """
@@ -266,13 +451,14 @@ class ProviderSelector:
             memory_gb: Required memory in GB
             storage_gb: Required storage in GB
             headers: Request headers
+            domain: Tenant domain for dedicated provider lookup
             **kwargs: Additional criteria
 
         Returns:
             Selected Provider or None
         """
         return await self.strategy.select_provider(
-            cpu_cores, memory_gb, storage_gb, headers, **kwargs
+            cpu_cores, memory_gb, storage_gb, headers, domain=domain, **kwargs
         )
 
     async def get_available_providers(

@@ -93,7 +93,7 @@ function App() {
     setNewDb(prev => ({ ...prev, engine: '', version: '' }))
 
     try {
-      let url = `${API_BASE}/providers/engines`
+      let url = `${API_BASE}/domain/${DOMAIN}/providers/engines`
       const params = new URLSearchParams()
       if (region) params.append('region', region)
       if (availabilityZone) params.append('availability_zone', availabilityZone)

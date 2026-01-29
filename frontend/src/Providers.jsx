@@ -14,6 +14,7 @@ function Providers({ showNotification }) {
     region: '',
     availability_zone: '',
     cloud_provider: 'AWS',
+    domain: '',
     cpu_total_cores: 100,
     memory_total_gb: 200,
     storage_total_gb: 1000,
@@ -103,10 +104,13 @@ function Providers({ showNotification }) {
     if (!validateForm()) return
 
     try {
+      // Convert empty domain to null so backend treats it as a shared provider
+      const payload = { ...newProvider, domain: newProvider.domain.trim() || null }
+
       const response = await fetch(`${API_BASE}/providers/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newProvider)
+        body: JSON.stringify(payload)
       })
 
       if (!response.ok) {
@@ -138,10 +142,13 @@ function Providers({ showNotification }) {
 
   const handleUpdate = async () => {
     try {
+      // Convert empty domain to null so backend treats it as a shared provider
+      const payload = { ...newProvider, domain: newProvider.domain.trim() || null }
+
       const response = await fetch(`${API_BASE}/providers/${selectedProvider.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newProvider)
+        body: JSON.stringify(payload)
       })
 
       if (!response.ok) throw new Error('Failed to update provider')
@@ -180,6 +187,7 @@ function Providers({ showNotification }) {
       region: '',
       availability_zone: '',
       cloud_provider: 'AWS',
+      domain: '',
       cpu_total_cores: 100,
       memory_total_gb: 200,
       storage_total_gb: 1000,
@@ -209,6 +217,7 @@ function Providers({ showNotification }) {
       region: provider.region,
       availability_zone: provider.availability_zone || '',
       cloud_provider: provider.cloud_provider || 'AWS',
+      domain: provider.domain || '',
       cpu_total_cores: provider.resources.cpu.total_cores,
       memory_total_gb: provider.resources.memory.total_gb,
       storage_total_gb: provider.resources.storage.total_gb,
@@ -288,6 +297,34 @@ function Providers({ showNotification }) {
                       {provider.cloud_provider} • {provider.region}
                       {provider.availability_zone && ` • ${provider.availability_zone}`}
                     </p>
+                    {provider.domain && (
+                      <span style={{
+                        display: 'inline-block',
+                        marginTop: '0.35rem',
+                        padding: '0.2rem 0.6rem',
+                        backgroundColor: '#dbeafe',
+                        color: '#1d4ed8',
+                        borderRadius: '12px',
+                        fontSize: '0.75rem',
+                        fontWeight: 600
+                      }}>
+                        Dedicated: {provider.domain}
+                      </span>
+                    )}
+                    {!provider.domain && (
+                      <span style={{
+                        display: 'inline-block',
+                        marginTop: '0.35rem',
+                        padding: '0.2rem 0.6rem',
+                        backgroundColor: '#f3f4f6',
+                        color: '#6b7280',
+                        borderRadius: '12px',
+                        fontSize: '0.75rem',
+                        fontWeight: 600
+                      }}>
+                        Shared
+                      </span>
+                    )}
                   </div>
                   <span
                     className="status-badge"
@@ -348,7 +385,32 @@ function Providers({ showNotification }) {
                 </div>
 
                 <div className="provider-footer">
-                  <span className="priority-badge">Priority: {provider.priority}</span>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span className="priority-badge">Priority: {provider.priority}</span>
+                    {provider.domain ? (
+                      <span style={{
+                        padding: '0.2rem 0.6rem',
+                        backgroundColor: '#dbeafe',
+                        color: '#1d4ed8',
+                        borderRadius: '12px',
+                        fontSize: '0.7rem',
+                        fontWeight: 600
+                      }}>
+                        Domain: {provider.domain}
+                      </span>
+                    ) : (
+                      <span style={{
+                        padding: '0.2rem 0.6rem',
+                        backgroundColor: '#f3f4f6',
+                        color: '#6b7280',
+                        borderRadius: '12px',
+                        fontSize: '0.7rem',
+                        fontWeight: 600
+                      }}>
+                        Shared
+                      </span>
+                    )}
+                  </div>
                   <div className="action-buttons">
                     <button className="btn-secondary" onClick={() => openEditModal(provider)}>
                       Edit
@@ -428,6 +490,24 @@ function Providers({ showNotification }) {
                       placeholder="us-east-1a"
                     />
                     <small>Optional</small>
+                  </div>
+
+                  <div className="form-group">
+                    <label>Dedicated Domain</label>
+                    <input
+                      type="text"
+                      value={newProvider.domain}
+                      onChange={e => setNewProvider({...newProvider, domain: e.target.value})}
+                      placeholder="my-tenant-domain"
+                    />
+                    <small>
+                      {selectedProvider && selectedProvider.domain
+                        ? `Currently dedicated to: "${selectedProvider.domain}". Change or clear to update.`
+                        : selectedProvider && !selectedProvider.domain
+                          ? 'Currently shared. Set a domain to make it dedicated.'
+                          : 'Bind this provider to a specific tenant domain. Leave empty for shared provider.'
+                      }
+                    </small>
                   </div>
                 </div>
               </div>

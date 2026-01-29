@@ -350,6 +350,11 @@ app.include_router(health.router, prefix="/health", tags=["Health"])
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(versions.router, prefix="/api/v1/versions", tags=["Versions"])
 app.include_router(providers.router, prefix="/api/v1/providers", tags=["Providers"])
+app.include_router(
+    providers.domain_router,
+    prefix="/api/v1/domain/{domain_name}/providers",
+    tags=["Domain Providers"],
+)
 app.include_router(operations.router, prefix="/api/v1/operations", tags=["Operations"])
 app.include_router(
     databases.router,

@@ -139,16 +139,32 @@ class DatabaseService:
         )
 
         # PRE-CHECK 3: Select provider (validates resource availability)
+        # Passes domain so the selector can prioritize dedicated providers for this domain.
+        # If dedicated providers exist but are at capacity, selection returns None and we error out.
         headers = headers or {}
-        
+
         selected_provider = await provider_selector.select_provider(
             cpu_cores=cpu_cores,
             memory_gb=memory_gb,
             storage_gb=storage_gb,
             headers=headers,
+            domain=domain,
         )
 
         if not selected_provider:
+            # Check whether dedicated providers exist for this domain (to give a targeted error)
+            dedicated_exist = await Provider.find(
+                Provider.domain == domain,
+                Provider.is_active == True,
+            ).count()
+
+            if dedicated_exist > 0:
+                raise ResourceAllocationError(
+                    f"Dedicated provider(s) for domain '{domain}' are at capacity. "
+                    f"Required: {cpu_cores} CPU cores, {memory_gb}GB memory, {storage_gb}GB storage. "
+                    f"No fallback to shared providers when dedicated providers exist."
+                )
+
             raise ResourceAllocationError(
                 f"No provider available with sufficient resources: "
                 f"{cpu_cores} CPU cores, {memory_gb}GB memory, {storage_gb}GB storage. "

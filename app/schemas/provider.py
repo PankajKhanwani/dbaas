@@ -31,6 +31,10 @@ class ProviderCreate(ProviderResourcesBase):
     availability_zone: Optional[str] = Field(None, max_length=50)
     cloud_provider: Optional[str] = Field(None, max_length=50)
 
+    # Domain binding — set to bind this provider as dedicated to a specific tenant domain.
+    # Providers without a domain are treated as shared/general providers.
+    domain: Optional[str] = Field(None, max_length=100, description="Tenant domain this provider is dedicated to. Leave None for shared providers.")
+
     kubeconfig_path: Optional[str] = None
     kubeconfig_content: Optional[str] = None
     api_endpoint: Optional[str] = None
@@ -51,6 +55,7 @@ class ProviderUpdate(BaseModel):
     region: Optional[str] = None
     availability_zone: Optional[str] = None
     cloud_provider: Optional[str] = None
+    domain: Optional[str] = Field(None, max_length=100, description="Tenant domain this provider is dedicated to. Set to None to make shared.")
 
     cpu_total_cores: Optional[float] = Field(None, gt=0)
     memory_total_gb: Optional[float] = Field(None, gt=0)
@@ -96,6 +101,7 @@ class ProviderResponse(BaseModel):
     region: str
     availability_zone: Optional[str]
     cloud_provider: Optional[str]
+    domain: Optional[str] = None
     resources: ProviderResources
     is_active: bool
     is_maintenance: bool

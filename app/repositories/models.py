@@ -167,6 +167,9 @@ class Provider(Document):
     availability_zone: Optional[Indexed(str)] = None  # type: ignore
     cloud_provider: Optional[str] = None
 
+    # Domain binding (dedicated provider for a specific tenant domain)
+    domain: Optional[Indexed(str)] = None  # type: ignore
+
     # Resource capacity (total)
     cpu_total_cores: float
     memory_total_gb: float
@@ -501,4 +504,4 @@ class Provider(Document):
 
     class Settings:
         name = "providers"
-        indexes = ["name", "region", "availability_zone", "is_active", "priority"]
+        indexes = ["name", "region", "availability_zone", "domain", "is_active", "priority"]
