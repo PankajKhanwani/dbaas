@@ -1,0 +1,120 @@
+# Allowed Database Versions Configuration
+# Supports both simple version lists and flavor-based filtering
+# Format: engine_name: { flavors: { flavor_name: { enabled, name_pattern, versions } } }
+
+# MongoDB versions
+mongodb:
+  flavors:
+    official:
+      enabled: false
+      name_pattern: "^[0-9]"  # Matches: 8.0.3, 7.0.14 (starts with digit)
+      description: "Official MongoDB Community Edition"
+      versions:
+        - "8.0.3"
+        - "7.0.14"
+        - "6.0.16"
+        - "5.0.28"
+    percona:
+      enabled: false  # Set to true to show Percona MongoDB versions
+      name_pattern: "^percona-"  # Matches: percona-7.0.14, percona-6.0.16
+      description: "Percona Server for MongoDB"
+      versions:
+        - "percona-7.0.14"
+        - "percona-6.0.16"
+
+# PostgreSQL versions
+postgres:
+  flavors:
+    official:
+      enabled: true
+      name_pattern: "^[0-9]+\\.[0-9]+$"  # Matches: 17.2, 16.4 (no suffix)
+      description: "Official PostgreSQL"
+      versions:
+        - "17.5"
+        - "17.4"
+        - "17.2"
+        - "16.10"
+        - "16.9"
+        - "16.8"
+        - "16.6"
+        - "16.4"
+        - "15.13"
+        - "15.12"
+        - "15.10"
+        - "15.8"
+        - "15.5"
+    bookworm:
+      enabled: false  # Set to true to show Debian Bookworm builds
+      name_pattern: ".*-bookworm$"  # Matches: 16.4-bookworm, 15.10-bookworm
+      description: "PostgreSQL on Debian Bookworm"
+      versions:
+        - "16.4-bookworm"
+        - "15.10-bookworm"
+
+# MySQL versions
+mysql:
+  flavors:
+    official:
+      enabled: true
+      name_pattern: "^[0-9]"
+      description: "Official MySQL Community Server"
+      versions:
+        - "9.0.1"
+        - "8.4.3"
+        - "8.4.2"
+        - "8.2.0"
+        - "8.1.0"
+        - "8.0.36"
+        - "5.7.44"
+
+# MariaDB versions
+mariadb:
+  flavors:
+    official:
+      enabled: true
+      name_pattern: "^[0-9]"
+      description: "Official MariaDB Server"
+      versions:
+        - "11.4.4"
+        - "11.1.6"
+        - "10.11.10"
+
+# Redis versions
+redis:
+  flavors:
+    official:
+      enabled: false  # Set to true to show official Redis
+      name_pattern: "^[0-9]"  # Matches: 7.2.6 (starts with digit)
+      description: "Official Redis"
+      versions:
+        - "7.2.6"
+        - "6.2.16"
+    valkey:
+      enabled: true  # Valkey is Redis-compatible fork
+      name_pattern: "^valkey-|^[0-9]"  # Matches: valkey-7.4.1 OR plain version if Valkey CRD
+      description: "Valkey (Redis-compatible)"
+      versions:
+        - "8.1.1"
+        - "valkey-8.0.3"
+        - "valkey-7.2.9"
+        - "7.2.5"
+
+# Elasticsearch versions
+elasticsearch:
+  flavors:
+    official:
+      enabled: true
+      name_pattern: "^[0-9]"
+      description: "Official Elasticsearch"
+      versions:
+        - "8.16.1"
+        - "8.15.4"
+        - "7.17.26"
+
+# Configuration options
+config:
+  # Set to true to allow all versions from KubeDB (bypass filtering)
+  allow_all: false
+
+  # Set to true to include version metadata from KubeDB
+  include_metadata: true
