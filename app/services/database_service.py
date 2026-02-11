@@ -32,7 +32,7 @@ from app.services.audit_service import audit_service
 from app.services.provider_selector import provider_selector, ProviderSelectionStrategy
 from app.services.resource_allocation import ResourceAllocationService
 from app.core.exceptions import ResourceAllocationError, InvalidProviderError
-from app.utils.namespace import generate_namespace_name
+from app.utils.namespace import generate_namespace_name, generate_database_namespace
 
 logger = get_logger(__name__)
 
@@ -221,12 +221,14 @@ class DatabaseService:
         kubedb_name = f"{db_request.name}-{domain}-{project}".lower()
         kubedb_name = kubedb_name[:63].rstrip('-')
 
-        # PRE-CHECK 6: Generate namespace name from domain and project
-        namespace = generate_namespace_name(domain, project)
+        # PRE-CHECK 6: Generate dedicated namespace for this database
+        # Each database gets its own namespace for better isolation
+        namespace = generate_database_namespace(domain, project, db_request.name)
         logger.info(
             "namespace_generated",
             domain=domain,
             project=project,
+            database_name=db_request.name,
             namespace=namespace,
         )
 

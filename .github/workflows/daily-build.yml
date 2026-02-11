@@ -1,0 +1,41 @@
+name: Daily Build
+
+on:
+  schedule:
+    # Run daily at 7:30 PM IST (2:00 PM UTC)
+    - cron: "30 14 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Login to Docker Hub
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKER_PWD: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
+        run: sudo docker login -u $DOCKER_USER -p $DOCKER_PWD
+
+      - name: Prepare image tag
+        run: echo "TAG=$(TZ='Asia/Kolkata' date +'%F')" >> $GITHUB_ENV
+
+      - name: Build Docker image
+        run: sudo docker build -t coredgeio/dbaas-k8s:${{ env.TAG }} .
+
+      - name: Tag as latest
+        run: sudo docker tag coredgeio/dbaas-k8s:${{ env.TAG }} coredgeio/dbaas-k8s:latest
+
+      - name: Push Docker images
+        run: |
+          sudo docker push coredgeio/dbaas-k8s:${{ env.TAG }}
+          sudo docker push coredgeio/dbaas-k8s:latest
+          sudo docker system prune -a -f
+
+      - name: Docker cleanup
+        if: always()
+        run: sudo docker logout

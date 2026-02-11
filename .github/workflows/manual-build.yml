@@ -1,0 +1,37 @@
+name: Manual Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Docker image tag"
+        required: true
+        default: "latest"
+        type: string
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Login to Docker Hub
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKER_PWD: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
+        run: sudo docker login -u $DOCKER_USER -p $DOCKER_PWD
+
+      - name: Build Docker image
+        run: sudo docker build -t coredgeio/dbaas-k8s:${{ github.event.inputs.tag }} .
+
+      - name: Push Docker image
+        run: |
+          sudo docker push coredgeio/dbaas-k8s:${{ github.event.inputs.tag }}
+          sudo docker system prune -a -f
+
+      - name: Docker cleanup
+        if: always()
+        run: sudo docker logout

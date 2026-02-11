@@ -1,0 +1,65 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Login to Docker Hub
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKER_PWD: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
+        run: sudo docker login -u $DOCKER_USER -p $DOCKER_PWD
+
+      - name: Build Docker image
+        run: sudo docker build -t coredgeio/dbaas-k8s:${{ env.VERSION }} .
+
+      - name: Tag images
+        run: |
+          sudo docker tag coredgeio/dbaas-k8s:${{ env.VERSION }} coredgeio/dbaas-k8s:latest
+          sudo docker tag coredgeio/dbaas-k8s:${{ env.VERSION }} coredgeio/dbaas-k8s:${{ env.TAG_NAME }}
+
+      - name: Push Docker images
+        run: |
+          sudo docker push coredgeio/dbaas-k8s:${{ env.VERSION }}
+          sudo docker push coredgeio/dbaas-k8s:${{ env.TAG_NAME }}
+          sudo docker push coredgeio/dbaas-k8s:latest
+          sudo docker system prune -a -f
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          release_name: Release ${{ env.TAG_NAME }}
+          body: |
+            ## KubeDB DBaaS Release ${{ env.TAG_NAME }}
+
+            ### Docker Image
+            ```
+            docker pull coredgeio/dbaas-k8s:${{ env.VERSION }}
+            ```
+
+            ### Changes
+            See commit history for detailed changes.
+          draft: false
+          prerelease: false
+
+      - name: Docker cleanup
+        if: always()
+        run: sudo docker logout
