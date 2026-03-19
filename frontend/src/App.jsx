@@ -861,7 +861,24 @@ function App() {
                   </div>
                   {db.endpoint && (
                     <div className="endpoint-box">
-                      <code>{db.endpoint}:{db.port}</code>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                        <code>{db.endpoint}:{db.port}</code>
+                        {db.service_type === 'LoadBalancer' && (
+                          <span
+                            style={{
+                              fontSize: '0.7rem',
+                              padding: '2px 6px',
+                              background: '#3b82f6',
+                              color: 'white',
+                              borderRadius: '4px',
+                              fontWeight: '500'
+                            }}
+                            title={db.loadbalancer_ip ? `External IP: ${db.loadbalancer_ip}` : 'LoadBalancer service'}
+                          >
+                            ⚡ External
+                          </span>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1543,6 +1560,22 @@ function App() {
                         <dd><code>{selectedDb.endpoint || 'Not ready'}</code></dd>
                         <dt>Port</dt>
                         <dd>{selectedDb.port || 'N/A'}</dd>
+                        <dt>Service Type</dt>
+                        <dd>
+                          {selectedDb.service_type === 'LoadBalancer' ? (
+                            <span style={{ color: '#3b82f6', fontWeight: '500' }}>
+                              ⚡ LoadBalancer (External)
+                            </span>
+                          ) : (
+                            <span>ClusterIP (Internal)</span>
+                          )}
+                        </dd>
+                        {selectedDb.service_type === 'LoadBalancer' && selectedDb.loadbalancer_ip && (
+                          <>
+                            <dt>External IP</dt>
+                            <dd><code>{selectedDb.loadbalancer_ip}</code></dd>
+                          </>
+                        )}
                       </dl>
                     </div>
                   </div>
@@ -1634,6 +1667,19 @@ function App() {
                         <label>Port</label>
                         <code>{dbCredentials.port}</code>
                       </div>
+                      {selectedDb && selectedDb.service_type === 'LoadBalancer' && (
+                        <div className="cred-item full-width" style={{ background: '#eff6ff', border: '1px solid #3b82f6', borderRadius: '4px', padding: '0.75rem' }}>
+                          <label style={{ color: '#1d4ed8', fontWeight: '500' }}>⚡ External Access Enabled</label>
+                          <div style={{ fontSize: '0.85rem', color: '#1e40af', marginTop: '0.25rem' }}>
+                            This database is accessible from outside the cluster via LoadBalancer.
+                            {selectedDb.loadbalancer_ip && (
+                              <div style={{ marginTop: '0.25rem' }}>
+                                <strong>External IP:</strong> <code style={{ background: 'white', padding: '2px 6px' }}>{selectedDb.loadbalancer_ip}</code>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
                       <div className="cred-item full-width">
                         <label>Connection String</label>
                         <code className="connection-string">{dbCredentials.connection_string}</code>

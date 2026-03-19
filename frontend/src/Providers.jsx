@@ -24,6 +24,7 @@ function Providers({ showNotification }) {
     kubeconfig_content: '',
     api_endpoint: '',
     verify_ssl: true,
+    enable_loadbalancer: false,
     is_active: true,
     priority: 100,
     tags: {},
@@ -227,6 +228,7 @@ function Providers({ showNotification }) {
       kubeconfig_content: provider.kubeconfig_content || '',
       api_endpoint: provider.api_endpoint || '',
       verify_ssl: provider.verify_ssl !== undefined ? provider.verify_ssl : true,
+      enable_loadbalancer: provider.enable_loadbalancer || false,
       is_active: provider.is_active,
       priority: provider.priority,
       tags: provider.tags || {},
@@ -326,12 +328,23 @@ function Providers({ showNotification }) {
                       </span>
                     )}
                   </div>
-                  <span
-                    className="status-badge"
-                    style={{ backgroundColor: getStatusColor(provider.is_active) }}
-                  >
-                    {provider.is_active ? 'Active' : 'Inactive'}
-                  </span>
+                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                    {provider.enable_loadbalancer && (
+                      <span
+                        className="status-badge"
+                        style={{ backgroundColor: '#3b82f6', fontSize: '0.75rem' }}
+                        title="LoadBalancer enabled - databases get external IPs"
+                      >
+                        ⚡ LoadBalancer
+                      </span>
+                    )}
+                    <span
+                      className="status-badge"
+                      style={{ backgroundColor: getStatusColor(provider.is_active) }}
+                    >
+                      {provider.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="provider-body">
@@ -654,6 +667,20 @@ function Providers({ showNotification }) {
                   </label>
                   <small style={{ display: 'block', marginTop: '0.5rem', marginLeft: '1.5rem' }}>
                     Disable only for clusters with certificate issues (not recommended for production)
+                  </small>
+                </div>
+
+                <div className="form-group">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={newProvider.enable_loadbalancer}
+                      onChange={e => setNewProvider({...newProvider, enable_loadbalancer: e.target.checked})}
+                    />
+                    Enable LoadBalancer (MetalLB)
+                  </label>
+                  <small style={{ display: 'block', marginTop: '0.5rem', marginLeft: '1.5rem' }}>
+                    Databases on this provider will get external IPs via MetalLB LoadBalancer
                   </small>
                 </div>
               </div>

@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # Monitoring
     prometheus_enabled: bool = Field(default=True, description="Enable Prometheus metrics")
     prometheus_port: int = Field(default=9090, ge=1, le=65535, description="Prometheus port")
+    prometheus_release_name: str = Field(
+        default="kube-prom-stack",
+        description="Prometheus Operator Helm release name for ServiceMonitor labels"
+    )
     jaeger_enabled: bool = Field(default=False, description="Enable Jaeger tracing")
     jaeger_agent_host: str = Field(default="localhost", description="Jaeger agent host")
     jaeger_agent_port: int = Field(default=6831, ge=1, le=65535, description="Jaeger agent port")

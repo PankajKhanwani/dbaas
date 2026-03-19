@@ -5,10 +5,7 @@ metadata:
   namespace: kubedb-dbaas
   labels:
     app: kubedb-dbaas-api
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "8000"
-    prometheus.io/path: "/metrics"
+  # Removed annotation-based Prometheus discovery - now using ServiceMonitor
 spec:
   type: ClusterIP
   ports:

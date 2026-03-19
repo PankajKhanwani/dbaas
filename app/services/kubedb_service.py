@@ -833,6 +833,7 @@ class KubeDBService:
         labels: Dict[str, str],
         annotations: Dict[str, str],
         storage_class: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """Build PostgreSQL custom resource spec."""
         resources = self._get_resource_limits(size)
@@ -868,6 +869,14 @@ class KubeDBService:
             spec["standbyMode"] = "Hot"
             spec["streamingMode"] = "Asynchronous"
 
+        # Add service template for LoadBalancer support
+        if service_type == "LoadBalancer":
+            spec["serviceTemplate"] = {
+                "spec": {
+                    "type": "LoadBalancer"
+                }
+            }
+
         return spec
 
     def _build_mysql_spec(
@@ -881,6 +890,7 @@ class KubeDBService:
         labels: Dict[str, str],
         annotations: Dict[str, str],
         storage_class: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """Build MySQL custom resource spec."""
         resources = self._get_resource_limits(size)
@@ -913,6 +923,14 @@ class KubeDBService:
                 "group": {"name": group_uuid},
             }
 
+        # Add service template for LoadBalancer support
+        if service_type == "LoadBalancer":
+            spec["serviceTemplate"] = {
+                "spec": {
+                    "type": "LoadBalancer"
+                }
+            }
+
         return spec
 
     def _build_mariadb_spec(
@@ -926,6 +944,7 @@ class KubeDBService:
         labels: Dict[str, str],
         annotations: Dict[str, str],
         storage_class: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """Build MariaDB custom resource spec."""
         resources = self._get_resource_limits(size)
@@ -962,6 +981,14 @@ class KubeDBService:
                 "group": {"name": group_uuid},
             }
 
+        # Add service template for LoadBalancer support
+        if service_type == "LoadBalancer":
+            spec["serviceTemplate"] = {
+                "spec": {
+                    "type": "LoadBalancer"
+                }
+            }
+
         return spec
 
     def _build_mongodb_spec(
@@ -976,6 +1003,7 @@ class KubeDBService:
         annotations: Dict[str, str],
         auth_secret: Optional[str] = None,
         storage_class: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """
         Build MongoDB custom resource spec.
@@ -1063,6 +1091,14 @@ class KubeDBService:
         if auth_secret:
             spec["authSecret"] = {"name": auth_secret}
 
+        # Add service template for LoadBalancer support
+        if service_type == "LoadBalancer":
+            spec["serviceTemplate"] = {
+                "spec": {
+                    "type": "LoadBalancer"
+                }
+            }
+
         return spec
 
     def _build_redis_spec(
@@ -1076,6 +1112,7 @@ class KubeDBService:
         labels: Dict[str, str],
         annotations: Dict[str, str],
         storage_class: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """Build Redis custom resource spec."""
         resources = self._get_resource_limits(size)
@@ -1116,6 +1153,14 @@ class KubeDBService:
             # Standalone mode
             spec["mode"] = "Standalone"
 
+        # Add service template for LoadBalancer support
+        if service_type == "LoadBalancer":
+            spec["serviceTemplate"] = {
+                "spec": {
+                    "type": "LoadBalancer"
+                }
+            }
+
         return spec
 
     def _build_elasticsearch_spec(
@@ -1129,6 +1174,7 @@ class KubeDBService:
         labels: Dict[str, str],
         annotations: Dict[str, str],
         storage_class: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """Build Elasticsearch custom resource spec."""
         resources = self._get_resource_limits(size)
@@ -1197,6 +1243,14 @@ class KubeDBService:
             del spec["replicas"]
             del spec["storage"]
             del spec["podTemplate"]
+
+        # Add service template for LoadBalancer support
+        if service_type == "LoadBalancer":
+            spec["serviceTemplate"] = {
+                "spec": {
+                    "type": "LoadBalancer"
+                }
+            }
 
         return spec
 
@@ -1341,6 +1395,7 @@ class KubeDBService:
         monitoring_enabled: bool = False,
         provider_id: Optional[str] = None,
         kubeconfig_content: Optional[str] = None,
+        service_type: str = "ClusterIP",
     ) -> Dict[str, Any]:
         """
         Create a database using KubeDB custom resources.
@@ -1400,40 +1455,80 @@ class KubeDBService:
         # If custom credentials are provided, we'll patch the secret after the database is created
         if engine == DatabaseEngine.POSTGRES:
             spec = self._build_postgres_spec(
-                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class
+                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class, service_type
             )
         elif engine == DatabaseEngine.MYSQL:
             spec = self._build_mysql_spec(
-                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class
+                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class, service_type
             )
         elif engine == DatabaseEngine.MARIADB:
             spec = self._build_mariadb_spec(
-                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class
+                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class, service_type
             )
         elif engine == DatabaseEngine.MONGODB:
             spec = self._build_mongodb_spec(
                 name, version, size, storage_gb, replicas, high_availability, labels, annotations,
                 auth_secret=None,  # Let KubeDB create the secret
-                storage_class=storage_class
+                storage_class=storage_class,
+                service_type=service_type
             )
         elif engine == DatabaseEngine.REDIS:
             spec = self._build_redis_spec(
-                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class
+                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class, service_type
             )
         elif engine == DatabaseEngine.ELASTICSEARCH:
             spec = self._build_elasticsearch_spec(
-                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class
+                name, version, size, storage_gb, replicas, high_availability, labels, annotations, storage_class, service_type
             )
         else:
             raise KubeDBError(f"Unsupported database engine: {engine}")
 
         # Add monitoring configuration if enabled
         if monitoring_enabled:
+            # Determine exporter port based on engine
+            exporter_ports = {
+                DatabaseEngine.POSTGRES: 9187,
+                DatabaseEngine.MYSQL: 9104,
+                DatabaseEngine.MARIADB: 9104,
+                DatabaseEngine.MONGODB: 9216,
+                DatabaseEngine.REDIS: 9121,
+                DatabaseEngine.ELASTICSEARCH: 9114,
+            }
+            exporter_port = exporter_ports.get(engine, 56790)
+
+            # Extract database_id from labels
+            database_id = labels.get("database-id", "unknown") if labels else "unknown"
+
+            # Use Prometheus Operator agent for ServiceMonitor support
             spec["monitor"] = {
-                "agent": "prometheus.io/builtin",
+                "agent": "prometheus.io/operator",  # Changed from builtin to operator
                 "prometheus": {
                     "exporter": {
-                        "port": 56790
+                        "port": exporter_port
+                    },
+                    "serviceMonitor": {
+                        "labels": {
+                            "release": settings.prometheus_release_name,  # Match Prometheus Operator release
+                            "database-id": database_id  # Add database_id to ServiceMonitor labels
+                        },
+                        "interval": "30s",
+                        "endpoints": [
+                            {
+                                "port": "metrics",
+                                "relabelings": [
+                                    {
+                                        "action": "replace",
+                                        "sourceLabels": ["__meta_kubernetes_pod_uid"],
+                                        "targetLabel": "pod_uuid"
+                                    },
+                                    {
+                                        "action": "replace",
+                                        "sourceLabels": ["__meta_kubernetes_service_label_database_id"],
+                                        "targetLabel": "database_id"
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 }
             }

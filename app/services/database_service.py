@@ -232,6 +232,16 @@ class DatabaseService:
             namespace=namespace,
         )
 
+        # PRE-CHECK 7: Determine service type based on provider configuration
+        # If provider has LoadBalancer enabled, use LoadBalancer service type
+        service_type = "LoadBalancer" if selected_provider.enable_loadbalancer else "ClusterIP"
+        logger.info(
+            "service_type_determined",
+            provider_id=selected_provider.id,
+            provider_loadbalancer_enabled=selected_provider.enable_loadbalancer,
+            service_type=service_type,
+        )
+
         # Create database document (minimal save - status is PENDING)
         db = Database(
             name=db_request.name,
@@ -250,8 +260,9 @@ class DatabaseService:
             monitoring_enabled=db_request.monitoring_enabled,
             labels=db_request.labels or {},
             annotations=db_request.annotations or {},
-            namespace=namespace,  # Use domain-project based namespace
+            namespace=namespace,  # Use dedicated namespace per database
             kubedb_resource_name=kubedb_name,
+            service_type=service_type,  # Based on provider configuration
             # Multi-provider fields
             provider_id=selected_provider.id,
             allocated_cpu_cores=cpu_cores,
@@ -357,6 +368,7 @@ class DatabaseService:
                 monitoring_enabled=db.monitoring_enabled,
                 provider_id=provider_id,
                 kubeconfig_content=kubeconfig_content,
+                service_type=db.service_type,  # Pass service type from database config
             )
 
             logger.info(
@@ -1627,6 +1639,8 @@ class DatabaseService:
             monitoring_enabled=db.monitoring_enabled,
             endpoint=db.endpoint,
             port=db.port,
+            service_type=db.service_type,
+            loadbalancer_ip=db.loadbalancer_ip,
             labels=db.labels,
             annotations=db.annotations,
             created_at=db.created_at,

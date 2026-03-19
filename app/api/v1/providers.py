@@ -61,6 +61,7 @@ def _build_provider_response(provider) -> ProviderResponse:
         is_active=provider.is_active,
         is_maintenance=provider.is_maintenance,
         priority=provider.priority,
+        enable_loadbalancer=getattr(provider, 'enable_loadbalancer', False),  # Default to False for backwards compatibility
         tags=provider.tags,
         created_at=provider.created_at,
         updated_at=provider.updated_at,
@@ -595,7 +596,27 @@ async def get_available_versions(
             kubeconfig_content=provider.kubeconfig_content,
         )
 
-        return result
+        # Apply flavor-based version filtering
+        from app.services.version_filter import version_filter_service
+
+        versions_list = result.get("versions", [])
+        filtered_versions = version_filter_service.filter_versions(
+            engine=engine.lower(),
+            versions=versions_list
+        )
+
+        logger.info(
+            "version_filtering_applied",
+            engine=engine,
+            total_from_kubedb=len(versions_list),
+            after_filtering=len(filtered_versions),
+            filtered_out=len(versions_list) - len(filtered_versions),
+        )
+
+        return {
+            "engine": result.get("engine", engine),
+            "versions": filtered_versions,
+        }
 
     except Exception as e:
         logger.error(

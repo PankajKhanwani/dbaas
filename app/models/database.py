@@ -201,6 +201,8 @@ class DatabaseResponse(BaseModel):
     monitoring_enabled: bool = Field(..., description="Monitoring enabled")
     endpoint: Optional[str] = Field(default=None, description="Connection endpoint")
     port: Optional[int] = Field(default=None, description="Connection port")
+    service_type: str = Field(default="ClusterIP", description="Service type (ClusterIP or LoadBalancer)")
+    loadbalancer_ip: Optional[str] = Field(default=None, description="LoadBalancer external IP (if applicable)")
     labels: Dict[str, str] = Field(default_factory=dict, description="Labels")
     annotations: Dict[str, str] = Field(default_factory=dict, description="Annotations")
     created_at: datetime = Field(..., description="Creation timestamp")
