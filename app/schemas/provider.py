@@ -45,6 +45,10 @@ class ProviderCreate(ProviderResourcesBase):
         default=True,
         description="Verify SSL certificates (disable only for clusters with certificate issues)"
     )
+    enable_loadbalancer: bool = Field(
+        default=False,
+        description="Enable LoadBalancer service type for databases on this provider (requires MetalLB)"
+    )
     tags: Optional[Dict[str, Any]] = Field(default_factory=dict)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
@@ -72,6 +76,8 @@ class ProviderUpdate(BaseModel):
     is_active: Optional[bool] = None
     is_maintenance: Optional[bool] = None
     priority: Optional[int] = Field(None, ge=0, le=1000)
+    verify_ssl: Optional[bool] = None
+    enable_loadbalancer: Optional[bool] = None
     tags: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -106,6 +112,7 @@ class ProviderResponse(BaseModel):
     is_active: bool
     is_maintenance: bool
     priority: int
+    enable_loadbalancer: bool
     tags: Dict[str, Any]
     created_at: Optional[datetime]
     updated_at: Optional[datetime]

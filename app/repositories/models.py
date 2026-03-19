@@ -107,6 +107,8 @@ class Database(Document):
     monitoring_enabled: bool = True
     endpoint: Optional[str] = None
     port: Optional[int] = None
+    service_type: str = "ClusterIP"  # Service type: ClusterIP or LoadBalancer
+    loadbalancer_ip: Optional[str] = None  # External IP assigned by MetalLB (if LoadBalancer)
     labels: Dict[str, str] = Field(default_factory=dict)
     annotations: Dict[str, str] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -190,6 +192,9 @@ class Provider(Document):
     kubeconfig_content: Optional[str] = None
     api_endpoint: Optional[str] = None
     verify_ssl: bool = True  # Verify SSL certificates (disable only for clusters with cert issues)
+
+    # Network/Service configuration
+    enable_loadbalancer: bool = False  # Enable LoadBalancer service type for databases on this provider
 
     # Status
     is_active: bool = True

@@ -1326,6 +1326,9 @@ class DatabaseReconciler:
                 if endpoint_info:
                     db.endpoint = endpoint_info.get("host")
                     db.port = endpoint_info.get("port")
+                    # Update LoadBalancer IP if service type is LoadBalancer
+                    if db.service_type == "LoadBalancer":
+                        db.loadbalancer_ip = endpoint_info.get("host")
 
             # Handle pending operations based on OLD status (before we update it)
             # The reconciler performs the actual KubeDB operations
@@ -1544,6 +1547,9 @@ class DatabaseReconciler:
                     if endpoint_info:
                         db.endpoint = endpoint_info.get("host")
                         db.port = endpoint_info.get("port")
+                        # Update LoadBalancer IP if service type is LoadBalancer
+                        if db.service_type == "LoadBalancer":
+                            db.loadbalancer_ip = endpoint_info.get("host")
                         await db.save()
                 
                 # Check if backup was already triggered (avoid duplicate checks on every sync)
